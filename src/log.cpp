@@ -26,7 +26,7 @@ void Logger::format_str(const std::string &type, const std::string &msg, std::st
 void Logger::io_uring_prep_submit_task(const LogTask &task)
 {
     // 以fixed file、fixed buffer的方式提交sqe
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&io_uring_);
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
     // 考虑小概率情况：SQ全满了，没有位置，则阻塞等待
     if (sqe == NULL)
     {
@@ -36,14 +36,14 @@ void Logger::io_uring_prep_submit_task(const LogTask &task)
         assert(submitted_unconsumed_task_num_ != 0);
         {
             std::unique_lock cq_lock(io_uring_cq_mutex_);
-            int ret = io_uring_wait_cqe_nr(&io_uring_, &cqe, submitted_unconsumed_task_num_);
+            int ret = io_uring_wait_cqe_nr(&ring_, &cqe, submitted_unconsumed_task_num_);
             if (ret < 0)
                 UtilError::error_exit("io_uring_wait_cqe_nr failed with " + std::to_string(ret) + " while submitting task", false);
             // 回收内存
             for_each_cqe_retrieve_buffer();
         }
         // 这里在sqe锁内，当前线程是唯一提交LogTask的线程，所以前面清理出来的sqe空位不会被别的线程抢占
-        sqe = io_uring_get_sqe(&io_uring_);
+        sqe = io_uring_get_sqe(&ring_);
         assert(sqe != NULL);
     }
     // 绝大多数情况，以register buffer方式提交
@@ -63,7 +63,7 @@ void Logger::for_each_cqe_retrieve_buffer()
 {
     struct io_uring_cqe *cqe;
     unsigned head, count = 0;
-    io_uring_for_each_cqe(&io_uring_, head, cqe)
+    io_uring_for_each_cqe(&ring_, head, cqe)
     {
         count++;
         // 接收透传数据
@@ -78,7 +78,7 @@ void Logger::for_each_cqe_retrieve_buffer()
             std::cout << "io_uring process io failed with buf_index=" << buffer_info->buf_index << " res=" << cqe->res << std::endl;
     }
     // 标记cqe已经消费
-    io_uring_cq_advance(&io_uring_, count);
+    io_uring_cq_advance(&ring_, count);
 }
 
 // 从多种不同渠道尝试获取一块buffer，优先等级：
@@ -100,7 +100,7 @@ Logger::BufferInfo *Logger::get_buffer()
             int buffer_index = new_buffer_index_.fetch_add(1);
             buffer_info = new BufferInfo(new_buf, max_log_len, buffer_index);
             // 注册到io_uring内核
-            int ret = io_uring_register_buffers_update_tag(&io_uring_, buffer_index, &buffer_info->iov, 0, 1);
+            int ret = io_uring_register_buffers_update_tag(&ring_, buffer_index, &buffer_info->iov, 0, 1);
             if (ret < 0)
                 UtilError::error_exit("failed to register buffers, " + std::to_string(ret), false);
             std::cout << "extend buffer pool size with buffer index " << new_buffer_index_ << std::endl;
@@ -123,7 +123,7 @@ Logger::BufferInfo *Logger::get_buffer()
             {
                 std::unique_lock cq_lock(io_uring_cq_mutex_);
                 struct io_uring_cqe *cqe;
-                int ret = io_uring_wait_cqe_nr(&io_uring_, &cqe, submitted_unconsumed_task_num_);
+                int ret = io_uring_wait_cqe_nr(&ring_, &cqe, submitted_unconsumed_task_num_);
                 // 回收内存
                 if (ret == 0)
                     for_each_cqe_retrieve_buffer();
@@ -196,7 +196,7 @@ Logger::Logger(const std::string &log_dir, const std::vector<LogName> &logname_l
     io_uring_params params;
     memset(&params, 0, sizeof(params));
     params.flags = IORING_SETUP_SQPOLL;
-    if (io_uring_queue_init_params(io_uring_entries_, &io_uring_, &params) < 0)
+    if (io_uring_queue_init_params(io_uring_entries_, &ring_, &params) < 0)
         UtilError::error_exit("io_uring setup failed", true);
     if (!(params.features & IORING_FEAT_FAST_POLL))
         UtilError::error_exit("IORING_FEAT_FAST_POLL not supported in current kernel", false);
@@ -205,7 +205,7 @@ Logger::Logger(const std::string &log_dir, const std::vector<LogName> &logname_l
     std::vector<int> fd_list(log_files.size(), -1);
     for (auto &&f : log_files)
         fd_list[f.second.file_index] = f.second.fd;
-    int ret = io_uring_register_files(&io_uring_, fd_list.data(), log_files.size());
+    int ret = io_uring_register_files(&ring_, fd_list.data(), log_files.size());
     if (ret < 0)
         UtilError::error_exit("failed to register files, " + std::to_string(ret), false);
 
@@ -236,13 +236,13 @@ Logger::Logger(const std::string &log_dir, const std::vector<LogName> &logname_l
     assert(max_fixed_buffer_capacity_ + max_unfixed_buffer_capcacity_ <= io_uring_entries_);
     // 这里提前设置足够大的max_buffer_capacity_，初始化时用init_buffer_capacity_，方便后续扩展内存池
     assert(max_fixed_buffer_capacity_ < UIO_MAXIOV);
-    // ret = io_uring_register_buffers(&io_uring_, buffer_array.data(), buffer_array.size());
-    ret = io_uring_register_buffers_sparse(&io_uring_, (unsigned int)max_fixed_buffer_capacity_);
+    // ret = io_uring_register_buffers(&ring_, buffer_array.data(), buffer_array.size());
+    ret = io_uring_register_buffers_sparse(&ring_, (unsigned int)max_fixed_buffer_capacity_);
     if (ret == -EINVAL)
         UtilError::error_exit("failed to register buffers sparse, please check if linux kernel version >= 5.19" + std::to_string(ret), false);
     else if (ret < 0)
         UtilError::error_exit("failed to register buffers sparse, " + std::to_string(ret), false);
-    ret = io_uring_register_buffers_update_tag(&io_uring_, 0, buffer_array.data(), 0, init_buffer_capacity_);
+    ret = io_uring_register_buffers_update_tag(&ring_, 0, buffer_array.data(), 0, init_buffer_capacity_);
     if (ret < 0)
         UtilError::error_exit("failed to update register buffers " + std::to_string(ret), false);
     new_buffer_index_.fetch_add(init_buffer_capacity_);
@@ -261,7 +261,7 @@ Logger::~Logger()
         if (submitted_unconsumed_task_num_ == io_uring_entries_)
         {
             struct io_uring_cqe *cqe;
-            int ret = io_uring_wait_cqe_nr(&io_uring_, &cqe, submitted_unconsumed_task_num_);
+            int ret = io_uring_wait_cqe_nr(&ring_, &cqe, submitted_unconsumed_task_num_);
             if (ret < 0)
                 UtilError::error_exit("io_uring_wait_cqe_nr failed with " + std::to_string(ret) + " in destructor", false);
             // 回收内存
@@ -275,18 +275,18 @@ Logger::~Logger()
         submit_task = true;
     }
     if (submit_task)
-        io_uring_submit(&io_uring_);
+        io_uring_submit(&ring_);
 
     // 等待io_uring完成已提交的io
     struct io_uring_cqe *cqe;
-    int ret = io_uring_wait_cqe_nr(&io_uring_, &cqe, submitted_unconsumed_task_num_);
+    int ret = io_uring_wait_cqe_nr(&ring_, &cqe, submitted_unconsumed_task_num_);
     if (ret < 0)
         UtilError::error_exit("io_uring_wait_cqe_nr failed with " + std::to_string(ret) + " in destructor", false);
 
     // 清理cqe以及buffer_info
     unsigned head;
     unsigned count = 0;
-    io_uring_for_each_cqe(&io_uring_, head, cqe)
+    io_uring_for_each_cqe(&ring_, head, cqe)
     {
         count++;
         // cqe中的buffer在此清理
@@ -294,20 +294,20 @@ Logger::~Logger()
         memcpy(&buffer_info, &cqe->user_data, sizeof(BufferInfo *));
         delete buffer_info;
     }
-    io_uring_cq_advance(&io_uring_, count);
+    io_uring_cq_advance(&ring_, count);
 
     // 未使用的buffer在此清理
     unused_buffer_.consume_all([](const BufferInfo *info)
                                { delete (char *)info->iov.iov_base;delete info; });
 
     // 取消注册file
-    io_uring_unregister_buffers(&io_uring_);
+    io_uring_unregister_buffers(&ring_);
 
     // 取消注册buffer
-    io_uring_unregister_files(&io_uring_);
+    io_uring_unregister_files(&ring_);
 
     // 关闭io_uring
-    io_uring_queue_exit(&io_uring_);
+    io_uring_queue_exit(&ring_);
 
     // 关闭文件
     for (const auto &it : log_files)
@@ -337,7 +337,7 @@ void Logger::log(const std::string &logname, const std::string &msg)
                 submitted_unconsumed_task_num_++;
             }
             // 提交前面填充的sqes
-            io_uring_submit(&io_uring_);
+            io_uring_submit(&ring_);
         }
 
         // 抢到cq锁的线程收割cqe，恢复可用缓存，不阻塞
@@ -345,7 +345,7 @@ void Logger::log(const std::string &logname, const std::string &msg)
         {
             struct io_uring_cqe *cqe;
             // 检查是否有新cqe，抢不到锁不阻塞
-            if (io_uring_peek_cqe(&io_uring_, &cqe) == 0)
+            if (io_uring_peek_cqe(&ring_, &cqe) == 0)
                 // 抢到锁的线程回收内存至可用队列
                 for_each_cqe_retrieve_buffer();
         }

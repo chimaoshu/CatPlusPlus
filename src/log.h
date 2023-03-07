@@ -78,7 +78,7 @@ private:
     std::atomic<int> unsubmitted_tasks_num_{0};                                        // 未提交日志任务的数量
     std::atomic<int> submitted_unconsumed_task_num_{0};                                // 已提交到io_uring但未收割的任务数量
 
-    struct io_uring io_uring_;               // io_uring实例
+    struct io_uring ring_;               // io_uring实例
     std::recursive_mutex io_uring_sq_mutex_; // 锁，保证只有一个线程操作sqe
     std::recursive_mutex io_uring_cq_mutex_; // 锁，保证只有一个线程操作cqe
     const int io_uring_entries_ = 1024;      // io_uring初始化entry数量
