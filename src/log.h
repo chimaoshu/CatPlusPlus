@@ -9,7 +9,6 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
-#include <cassert>
 
 #include <boost/lockfree/queue.hpp>
 
@@ -69,7 +68,6 @@ private:
 
     const int init_buffer_capacity_;                                                    // 初始缓存容量
     const int max_fixed_buffer_capacity_;                                               // buffer数量不够时会动态增长，但是不超过上限
-    const int max_unfixed_buffer_capcacity_;                                            // 不注册buffer上限
     std::atomic<int> unused_buffer_num_;                                                // 可用缓存数量
     boost::lockfree::queue<BufferInfo *> unused_buffer_{(size_t)init_buffer_capacity_}; // 缓存池中未被使用的buffer
     std::atomic<int> new_buffer_index_{0};                                              // 注册入内核的buffer_index，保证唯一性
@@ -78,7 +76,7 @@ private:
     std::atomic<int> unsubmitted_tasks_num_{0};                                        // 未提交日志任务的数量
     std::atomic<int> submitted_unconsumed_task_num_{0};                                // 已提交到io_uring但未收割的任务数量
 
-    struct io_uring ring_;               // io_uring实例
+    struct io_uring ring_;                   // io_uring实例
     std::recursive_mutex io_uring_sq_mutex_; // 锁，保证只有一个线程操作sqe
     std::recursive_mutex io_uring_cq_mutex_; // 锁，保证只有一个线程操作cqe
     const int io_uring_entries_ = 1024;      // io_uring初始化entry数量
@@ -100,13 +98,15 @@ private:
     BufferInfo *get_buffer();
 
 public:
-    // @param log_dir directory of log files
-    // @param logname_list a vector of log name, e.g. std::vector<string>{"debug", "info", "warn", "error"}
-    // @param init_fixed_buffer_num the initial num of fixed buffer
-    // @param max_fixed_buffer_pool_size fixed buffer pool can extend itself, this field is the upper limit size
-    // @param max_unfixed_buffer_pool_size when fixed buffer pool has reached the upper limit, unfixed buffer pool will be created, this field is the upper limit size
+    // @param log_dir 日志文件目录
+    // @param logname_list 日志名数组, e.g. std::vector<string>{"debug", "info", "warn", "error"}
+    // @param init_fixed_buffer_num fixed buffer初始数量
+     // @param max_fixed_buffer_pool_size fixed buffer不足时会扩展，该字段为其数量上限。受制于linux内核io_uring实现\
+    fixed buffer数组并不能动态扩展，幸运的是，linux 5.19后支持先开辟指定数量的空fixed buffer，后续再填充，\
+    该字段即为空fixed buffer的数量
+    // @param io_uring_entries sqe大小，不能少于max_fixed_buffer_pool_size
     Logger(const std::string &log_dir, const std::vector<LogName> &logname_list, int init_fixed_buffer_num,
-           int max_fixed_buffer_pool_size, int max_unfixed_buffer_pool_size);
+           int max_fixed_buffer_pool_size, int io_uring_entries);
 
     ~Logger();
 
@@ -130,7 +130,7 @@ private:
             std::vector<LogName>{"debug", "info", "warn", "error"},
             std::stoi(config::get("init_fixed_buffer_num", "32")),
             std::stoi(config::get("max_fixed_buffer_pool_size", "512")),
-            std::stoi(config::get("max_unfixed_buffer_pool_size", "64")));
+            std::stoi(config::get("io_uring_entries", "512")));
         return runtime_logger;
     }
 

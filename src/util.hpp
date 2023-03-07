@@ -63,11 +63,13 @@ namespace UtilError
             perror(msg.c_str());
         else
             std::cout << msg << std::endl;
-#ifdef DEBUG
-        throw "error";
-#else
-        exit(EXIT_FAILURE);
-#endif
+        std::abort();
+    }
+
+#define FORCE_ASSERT(expr) \
+    if (!(expr))          \
+    {                     \
+        std::abort();     \
     }
 } // namespace UtilError
 

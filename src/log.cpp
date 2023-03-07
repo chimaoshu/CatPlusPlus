@@ -7,7 +7,7 @@ void Logger::format_str(const std::string &type, const std::string &msg, std::st
     time_t now = time(0);
     char *time_cstr = ctime(&now);
     int len = strlen(time_cstr);
-    assert(len > 1);
+    FORCE_ASSERT(len > 1);
     time_cstr[len - 1] = '\0';
     std::string time_str(time_cstr);
 
@@ -33,7 +33,7 @@ void Logger::io_uring_prep_submit_task(const LogTask &task)
         // 等待cqe
         struct io_uring_cqe *cqe;
         std::cout << "SQ ring is full, blocked waiting" << std::endl;
-        assert(submitted_unconsumed_task_num_ != 0);
+        FORCE_ASSERT(submitted_unconsumed_task_num_ != 0);
         {
             std::unique_lock cq_lock(io_uring_cq_mutex_);
             int ret = io_uring_wait_cqe_nr(&ring_, &cqe, submitted_unconsumed_task_num_);
@@ -44,7 +44,7 @@ void Logger::io_uring_prep_submit_task(const LogTask &task)
         }
         // 这里在sqe锁内，当前线程是唯一提交LogTask的线程，所以前面清理出来的sqe空位不会被别的线程抢占
         sqe = io_uring_get_sqe(&ring_);
-        assert(sqe != NULL);
+        FORCE_ASSERT(sqe != NULL);
     }
     // 绝大多数情况，以register buffer方式提交
     if (task.buffer_info->buf_index < max_fixed_buffer_capacity_)
@@ -92,7 +92,7 @@ Logger::BufferInfo *Logger::get_buffer()
     BufferInfo *buffer_info;
     if (!unused_buffer_.pop(buffer_info))
     {
-        // 仍然可扩展内存池
+        // 仍然可扩展fixed buffer池
         if (new_buffer_index_ < max_fixed_buffer_capacity_)
         {
             // 无可用buffer，则新增一块
@@ -105,8 +105,8 @@ Logger::BufferInfo *Logger::get_buffer()
                 UtilError::error_exit("failed to register buffers, " + std::to_string(ret), false);
             std::cout << "extend buffer pool size with buffer index " << new_buffer_index_ << std::endl;
         }
-        // 少数情况：可注册内存池已经扩展至上限，不将buffer注册到io_uring，扩展缓冲buffer
-        else if (new_buffer_index_ < max_fixed_buffer_capacity_ + max_unfixed_buffer_capcacity_)
+        // 少数情况：fixed buffer池已经扩展至上限，不再将buffer注册到io_uring，但仍然开辟新buffer
+        else if (new_buffer_index_ < io_uring_entries_)
         {
             std::cout << "registered buffer size has reached the upper limit, extend a new unregistered buffer buffer_index= " << new_buffer_index_ << std::endl;
             int buffer_index = new_buffer_index_.fetch_add(1);
@@ -115,7 +115,7 @@ Logger::BufferInfo *Logger::get_buffer()
             // 提交时检查到new_buffer_index>=max_buffer_capacity_，则不使用fixed buffer提交
             buffer_info = new BufferInfo(new_buf, max_log_len, buffer_index);
         }
-        // 级少数情况：可注册buffer与不注册buffer均达到上限，则阻塞等待内存
+        // 级少数情况：内存数量已经等于io_uring_entries数量，继续开辟得到的提升不大
         else
         {
             std::cout << "run out of both registered and unregistered buffer, blocked waiting and retrive buffer" << std::endl;
@@ -145,15 +145,11 @@ Logger::BufferInfo *Logger::get_buffer()
     return buffer_info;
 }
 
-// @param log_dir directory of log files
-// @param logname_list a vector of log name, e.g. std::vector<string>{"debug", "info", "warn", "error"}
-// @param init_fixed_buffer_num the initial num of fixed buffer, which has high IO performance
-// @param fixed_buffer_pool_size fixed buffer pool can extend itself, this is the upper limit size
-// @param unfixed_buffer_pool_size when fixed buffer pool has reached the upper limit, unfixed buffer pool will be created, this is the upper limit size
 Logger::Logger(const std::string &log_dir, const std::vector<LogName> &logname_list, int init_fixed_buffer_num,
-               int fixed_buffer_pool_size, int unfixed_buffer_pool_size)
-    : log_dir_(log_dir), init_buffer_capacity_(init_fixed_buffer_num), max_fixed_buffer_capacity_(fixed_buffer_pool_size),
-      max_unfixed_buffer_capcacity_(unfixed_buffer_pool_size), io_uring_entries_(fixed_buffer_pool_size + unfixed_buffer_pool_size)
+               int fixed_buffer_pool_size, int io_uring_entries)
+    : log_dir_(log_dir), init_buffer_capacity_(init_fixed_buffer_num),
+      max_fixed_buffer_capacity_(fixed_buffer_pool_size),
+      io_uring_entries_(io_uring_entries)
 {
     // log_dir检查是否存在
     if (!UtilFile::dir_exists(log_dir_))
@@ -192,7 +188,7 @@ Logger::Logger(const std::string &log_dir, const std::vector<LogName> &logname_l
     }
 
     // 初始化io_uring
-    assert(sizeof(BufferInfo *) == sizeof(io_uring_sqe::user_data));
+    FORCE_ASSERT(sizeof(BufferInfo *) == sizeof(io_uring_sqe::user_data));
     io_uring_params params;
     memset(&params, 0, sizeof(params));
     params.flags = IORING_SETUP_SQPOLL;
@@ -227,15 +223,14 @@ Logger::Logger(const std::string &log_dir, const std::vector<LogName> &logname_l
     }
 
     // 注册register buffer
-    assert(unused_buffer_.is_lock_free());
-    assert(unsubmitted_tasks_.is_lock_free());
-    assert(io_uring_entries_ > 0);
-    assert(init_buffer_capacity_ > 0);
-    assert(max_fixed_buffer_capacity_ > 0);
-    assert(max_unfixed_buffer_capcacity_ > 0);
-    assert(max_fixed_buffer_capacity_ + max_unfixed_buffer_capcacity_ <= io_uring_entries_);
+    FORCE_ASSERT(unused_buffer_.is_lock_free());
+    FORCE_ASSERT(unsubmitted_tasks_.is_lock_free());
+    FORCE_ASSERT(io_uring_entries_ > 0);
+    FORCE_ASSERT(init_buffer_capacity_ > 0);
+    FORCE_ASSERT(max_fixed_buffer_capacity_ > 0);
+    FORCE_ASSERT(io_uring_entries_ >= max_fixed_buffer_capacity_);
     // 这里提前设置足够大的max_buffer_capacity_，初始化时用init_buffer_capacity_，方便后续扩展内存池
-    assert(max_fixed_buffer_capacity_ < UIO_MAXIOV);
+    FORCE_ASSERT(max_fixed_buffer_capacity_ < UIO_MAXIOV);
     // ret = io_uring_register_buffers(&ring_, buffer_array.data(), buffer_array.size());
     ret = io_uring_register_buffers_sparse(&ring_, (unsigned int)max_fixed_buffer_capacity_);
     if (ret == -EINVAL)
@@ -257,7 +252,7 @@ Logger::~Logger()
     while (unsubmitted_tasks_.pop(task))
     {
         // 保证sqe不满
-        assert(submitted_unconsumed_task_num_ <= io_uring_entries_);
+        FORCE_ASSERT(submitted_unconsumed_task_num_ <= io_uring_entries_);
         if (submitted_unconsumed_task_num_ == io_uring_entries_)
         {
             struct io_uring_cqe *cqe;
