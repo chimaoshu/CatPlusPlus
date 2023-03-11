@@ -101,9 +101,7 @@ public:
     // @param log_dir 日志文件目录
     // @param logname_list 日志名数组, e.g. std::vector<string>{"debug", "info", "warn", "error"}
     // @param init_fixed_buffer_num fixed buffer初始数量
-     // @param max_fixed_buffer_pool_size fixed buffer不足时会扩展，该字段为其数量上限。受制于linux内核io_uring实现\
-    fixed buffer数组并不能动态扩展，幸运的是，linux 5.19后支持先开辟指定数量的空fixed buffer，后续再填充，\
-    该字段即为空fixed buffer的数量
+    // @param max_fixed_buffer_pool_size fixed buffer不足时会扩展，该字段为其数量上限
     // @param io_uring_entries sqe大小，不能少于max_fixed_buffer_pool_size
     Logger(const std::string &log_dir, const std::vector<LogName> &logname_list, int init_fixed_buffer_num,
            int max_fixed_buffer_pool_size, int io_uring_entries);
@@ -112,8 +110,22 @@ public:
 
     // 写日志
     void log(const std::string &logname, const std::string &msg);
-    void log(const std::string &logname, const std::stringstream &msg);
 };
+
+// 创建logger函数
+#define CREATE_LOGGER_FUNCTION(name)              \
+    static void name(const std::string &msg)      \
+    {                                             \
+        get_logger().log(#name, msg);             \
+    }                                             \
+                                                  \
+    template <typename... Args>                   \
+    static void name(Args &&...args)              \
+    {                                             \
+        std::stringstream msg;                    \
+        (msg << ... << std::forward<Args>(args)); \
+        get_logger().log(#name, msg.str());       \
+    }
 
 // 全局静态变量写日志
 class Log
@@ -135,25 +147,10 @@ private:
     }
 
 public:
-    static void debug(const std::string &msg)
-    {
-        get_logger().log("debug", msg);
-    }
-
-    static void info(const std::string &msg)
-    {
-        get_logger().log("info", msg);
-    }
-
-    static void warn(const std::string &msg)
-    {
-        get_logger().log("warn", msg);
-    }
-
-    static void error(const std::string &msg)
-    {
-        get_logger().log("error", msg);
-    }
+    CREATE_LOGGER_FUNCTION(debug)
+    CREATE_LOGGER_FUNCTION(info)
+    CREATE_LOGGER_FUNCTION(warn)
+    CREATE_LOGGER_FUNCTION(error)
 };
 
 #endif // __LOG_H__

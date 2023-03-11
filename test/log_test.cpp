@@ -9,7 +9,10 @@
 void *debug(void *ptr)
 {
     for (int i = 0; i < NUM_TIMES; i++)
+    {
         Log::debug("this is a log " + std::to_string(i) + " " + std::to_string(pthread_self()));
+        Log::debug("this is a log ", i, " ", pthread_self());
+    }
     // pthread_exit(NULL);
     return nullptr;
 }
@@ -17,7 +20,10 @@ void *debug(void *ptr)
 void *info(void *ptr)
 {
     for (int i = 0; i < NUM_TIMES; i++)
+    {
         Log::info("this is a log " + std::to_string(i) + " " + std::to_string(pthread_self()));
+        Log::info("this is a log ", i, " ", pthread_self());
+    }
     // pthread_exit(NULL);
     return nullptr;
 }
@@ -25,7 +31,10 @@ void *info(void *ptr)
 void *warn(void *ptr)
 {
     for (int i = 0; i < NUM_TIMES; i++)
+    {
         Log::warn("this is a log " + std::to_string(i) + " " + std::to_string(pthread_self()));
+        Log::warn("this is a log ", i, " ", pthread_self());
+    }
     // pthread_exit(NULL);
     return nullptr;
 }
@@ -33,7 +42,10 @@ void *warn(void *ptr)
 void *error(void *ptr)
 {
     for (int i = 0; i < NUM_TIMES; i++)
+    {
         Log::error("this is a log " + std::to_string(i) + " " + std::to_string(pthread_self()));
+        Log::warn("this is a log ", i, " ", pthread_self());
+    }
     // pthread_exit(NULL);
     return nullptr;
 }

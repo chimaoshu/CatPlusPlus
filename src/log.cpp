@@ -366,9 +366,3 @@ void Logger::log(const std::string &logname, const std::string &msg)
     unsubmitted_tasks_.push(task);
     unsubmitted_tasks_num_++;
 }
-
-// 写日志
-void Logger::log(const std::string &logname, const std::stringstream &msg)
-{
-    log(logname, msg.str());
-}
