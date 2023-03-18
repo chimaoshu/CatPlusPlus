@@ -6,7 +6,7 @@
 #include <sstream>
 #include <string>
 
-#include "src/util.hpp"
+#include "util.hpp"
 
 class ConfigReader {
 private:
