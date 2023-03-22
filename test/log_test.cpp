@@ -1,7 +1,7 @@
 #include <pthread.h>
 #include <climits>
 
-#include "src/log.h"
+#include "log.h"
 
 // #define NUM_TIMES INT_MAX
 #define NUM_TIMES 5000

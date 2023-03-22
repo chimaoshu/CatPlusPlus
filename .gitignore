@@ -1,3 +1,13 @@
 !bin/app.conf
 bin/
 .vscode/
+.clangd/
+.cache/
+
+# CMake-generated files
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Makefile
+cmake_install.cmake
+# compile_commands.json
