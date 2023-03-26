@@ -1,18 +1,20 @@
 #ifndef __UTIL_HPP__
 #define __UTIL_HPP__
 
-#include <fstream>
-#include <iostream>
-#include <map>
-#include <sstream>
-#include <string>
-
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#include <cmath>
+
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <sstream>
+#include <string>
 
 namespace UtilFile {
 static bool dir_exists(const std::string &path) {
@@ -46,7 +48,7 @@ static bool fd_is_invalid_or_closed(int fd) {
   return fcntl(fd, F_GETFL) < 0 && errno == EBADF;
 }
 
-} // namespace UtilFile
+}  // namespace UtilFile
 
 namespace UtilError {
 static void error_exit(std::string msg, bool print_perror) {
@@ -61,11 +63,11 @@ static void error_exit(std::string msg, bool print_perror) {
 #endif
 }
 
-#define FORCE_ASSERT(expr)                                                     \
-  if (!(expr)) {                                                               \
-    std::abort();                                                              \
+#define FORCE_ASSERT(expr) \
+  if (!(expr)) {           \
+    std::terminate();      \
   }
-} // namespace UtilError
+}  // namespace UtilError
 
 namespace UtilSystem {
 // 守护进程
@@ -97,8 +99,7 @@ static int init_daemon() {
     UtilError::error_exit("fork fail while initializing deamon", true);
 
   // 关闭所有从父进程继承的不再需要的文件描述符
-  for (i = 0; i < NOFILE; i++)
-    close(i);
+  for (i = 0; i < NOFILE; i++) close(i);
 
   // 改变工作目录，使得进程不与任何文件系统联系
   // chdir("/");
@@ -111,21 +112,33 @@ static int init_daemon() {
 
   return 0;
 }
-} // namespace UtilSystem
+}  // namespace UtilSystem
 
 namespace UtilString {
 // 去掉input前后的字符c
 static std::string strip(const std::string &input, char c = ' ') {
   int start_pos = input.find_first_not_of(c);
-  if (start_pos == std::string::npos)
-    start_pos = 0;
+  if (start_pos == std::string::npos) start_pos = 0;
 
   int end_pos = input.find_last_not_of(c);
-  if (end_pos == std::string::npos)
-    end_pos = input.size() - 1;
+  if (end_pos == std::string::npos) end_pos = input.size() - 1;
 
   return input.substr(start_pos, end_pos - start_pos + 1);
 }
-} // namespace UtilString
+}  // namespace UtilString
 
-#endif // __UTIL_HPP__
+namespace UtilMath {
+// 下一个大于n的2的幂次
+static int next_power_of_two(int n) {
+  // n已经是2的幂次
+  if ((n & (n - 1)) == 0) {
+    return n;
+  }
+
+  int result = pow(2, ceil(log2(n)));
+  FORCE_ASSERT(result >= 0);
+  return result;
+}
+}  // namespace UtilMath
+
+#endif  // __UTIL_HPP__

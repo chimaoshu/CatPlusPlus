@@ -139,7 +139,7 @@ private:
         config::get("log_dir"),
         std::vector<LogName>{"debug", "info", "warn", "error"},
         std::stoi(config::get("init_fixed_buffer_num", "32")),
-        std::stoi(config::get("max_fixed_buffer_pool_size", "512")),
+        std::stoi(config::get("fixed_buffer_pool_size", "512")),
         std::stoi(config::get("io_uring_entries", "512")));
     return runtime_logger;
   }

@@ -13,9 +13,9 @@ void Logger::format_str(const std::string &type, const std::string &msg,
 
   // 格式化
   std::stringstream ss;
-  ss << "[" << type << "][" << time_str << "]" << msg;
-  if (msg.back() != '\n')
-    ss << "\n";
+  ss << "[" << type << "][" << time_str << "]"
+     << "[" << pthread_self() << "]" << msg;
+  if (msg.back() != '\n') ss << "\n";
   result = ss.str();
 }
 
@@ -133,8 +133,7 @@ Logger::BufferInfo *Logger::get_buffer() {
         int ret =
             io_uring_wait_cqe_nr(&ring_, &cqe, submitted_unconsumed_task_num_);
         // 回收内存
-        if (ret == 0)
-          for_each_cqe_retrieve_buffer();
+        if (ret == 0) for_each_cqe_retrieve_buffer();
         // submitted_unconsumed_task_num_为0，且无就绪CQE
         else if (ret == -EAGAIN)
           continue;
@@ -158,28 +157,26 @@ Logger::Logger(const std::string &log_dir,
                const std::vector<LogName> &logname_list,
                int init_fixed_buffer_num, int fixed_buffer_pool_size,
                int io_uring_entries)
-    : log_dir_(log_dir), init_buffer_capacity_(init_fixed_buffer_num),
+    : log_dir_(log_dir),
+      init_buffer_capacity_(init_fixed_buffer_num),
       max_fixed_buffer_capacity_(fixed_buffer_pool_size),
       io_uring_entries_(io_uring_entries) {
   // log_dir检查是否存在
   if (!UtilFile::dir_exists(log_dir_)) {
     // 创建目录
     bool success = UtilFile::dir_create(log_dir_);
-    if (!success)
-      UtilError::error_exit("create log dir failed, exit", true);
+    if (!success) UtilError::error_exit("create log dir failed, exit", true);
   }
 
   // 空列表
-  if (logname_list.empty())
-    std::cout << "logname list is empty" << std::endl;
+  if (logname_list.empty()) std::cout << "logname list is empty" << std::endl;
 
   // 创建文件并打开
   log_files.reserve(logname_list.size());
   for (int i = 0; i < logname_list.size(); i++) {
     // 空字符串
     const std::string &logname = logname_list[i];
-    if (logname.empty())
-      UtilError::error_exit("a logname is empty", false);
+    if (logname.empty()) UtilError::error_exit("a logname is empty", false);
 
     // 创建并打开只追加写的文件
     std::string filename = log_dir_ + '/' + logname + ".log";
@@ -208,8 +205,7 @@ Logger::Logger(const std::string &log_dir,
 
   // 注册register file
   std::vector<int> fd_list(log_files.size(), -1);
-  for (auto &&f : log_files)
-    fd_list[f.second.file_index] = f.second.fd;
+  for (auto &&f : log_files) fd_list[f.second.file_index] = f.second.fd;
   int ret = io_uring_register_files(&ring_, fd_list.data(), log_files.size());
   if (ret < 0)
     UtilError::error_exit("failed to register files, " + std::to_string(ret),
@@ -237,6 +233,9 @@ Logger::Logger(const std::string &log_dir,
   FORCE_ASSERT(io_uring_entries_ > 0);
   FORCE_ASSERT(init_buffer_capacity_ > 0);
   FORCE_ASSERT(max_fixed_buffer_capacity_ > 0);
+  FORCE_ASSERT(io_uring_entries_ >= 32 &&
+               (io_uring_entries_ & (io_uring_entries_ - 1)) == 0)
+  FORCE_ASSERT(max_fixed_buffer_capacity_ >= init_buffer_capacity_);
   FORCE_ASSERT(io_uring_entries_ >= max_fixed_buffer_capacity_);
   // 这里提前设置足够大的max_buffer_capacity_，初始化时用init_buffer_capacity_，方便后续扩展内存池
   FORCE_ASSERT(max_fixed_buffer_capacity_ < UIO_MAXIOV);
@@ -245,10 +244,11 @@ Logger::Logger(const std::string &log_dir,
   ret = io_uring_register_buffers_sparse(
       &ring_, (unsigned int)max_fixed_buffer_capacity_);
   if (ret == -EINVAL)
-    UtilError::error_exit("failed to register buffers sparse, please check if "
-                          "linux kernel version >= 5.19" +
-                              std::to_string(ret),
-                          false);
+    UtilError::error_exit(
+        "failed to register buffers sparse, please check if "
+        "linux kernel version >= 5.19" +
+            std::to_string(ret),
+        false);
   else if (ret < 0)
     UtilError::error_exit(
         "failed to register buffers sparse, " + std::to_string(ret), false);
@@ -286,8 +286,7 @@ Logger::~Logger() {
     submitted_unconsumed_task_num_++;
     submit_task = true;
   }
-  if (submit_task)
-    io_uring_submit(&ring_);
+  if (submit_task) io_uring_submit(&ring_);
 
   // 等待io_uring完成已提交的io
   struct io_uring_cqe *cqe;
@@ -325,8 +324,7 @@ Logger::~Logger() {
   io_uring_queue_exit(&ring_);
 
   // 关闭文件
-  for (const auto &it : log_files)
-    close(it.second.fd);
+  for (const auto &it : log_files) close(it.second.fd);
 }
 
 // 写日志
@@ -382,4 +380,8 @@ void Logger::log(const std::string &logname, const std::string &msg) {
   LogTask task(copy_len, &log_file->second, buffer_info);
   unsubmitted_tasks_.push(task);
   unsubmitted_tasks_num_++;
+
+#ifndef PRODUCTION
+  std::cout << msg << std::endl;
+#endif
 }
