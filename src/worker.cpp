@@ -1,5 +1,11 @@
 #include "worker.h"
 
+#include <string.h>
+
+#include <boost/beast/core/make_printable.hpp>
+#include <boost/optional/optional_io.hpp>
+#include <typeinfo>
+
 void Worker::add_multishot_accept(int listen_fd) {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
   FORCE_ASSERT(sqe != NULL);
@@ -18,7 +24,7 @@ void Worker::add_multishot_accept(int listen_fd) {
 }
 
 // 提交recv请求
-void Worker::add_recv(int sock_fd_idx, ConnectionTask::CoroutineHandler handler,
+void Worker::add_recv(int sock_fd_idx, ConnectionTaskHandler handler,
                       bool poll_first) {
   // 设置SQE
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
@@ -38,41 +44,41 @@ void Worker::add_recv(int sock_fd_idx, ConnectionTask::CoroutineHandler handler,
 }
 
 // 提交send_zc请求
-void Worker::add_zero_copy_send(int sock_fd_idx,
-                                ConnectionTask::CoroutineHandler handler,
-                                std::list<int> used_buffer_id, int msg_len) {
+void Worker::add_zero_copy_send(
+    int sock_fd_idx, ConnectionTaskHandler handler,
+    const std::list<std::pair<int, int>> &used_buffer_id_len) {
   // 循环准备SQE，使用IOSQE_IO_LINK串联起来
-  int remain_bytes = msg_len;
-  for (auto buf_id : used_buffer_id) {
+  for (auto buf_id_len : used_buffer_id_len) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     FORCE_ASSERT(sqe != NULL);
 
     // 填充sqe
-    int buf_size = std::min(remain_bytes, page_size);
-    io_uring_prep_send_zc_fixed(sqe, sock_fd_idx, write_buffer_pool_[buf_id],
-                                buf_size, MSG_WAITALL, 0, buf_id);
+    io_uring_prep_send_zc_fixed(
+        sqe, sock_fd_idx, write_buffer_pool_[buf_id_len.first],
+        buf_id_len.second, MSG_WAITALL, 0, buf_id_len.first);
     sqe->flags |= IOSQE_FIXED_FILE;
 
     // 长度大于1则需要链接，以保证先后顺序，最后一个不设置，表示链接结束
-    if (used_buffer_id.size() > 1 && buf_id != used_buffer_id.back())
+    if (used_buffer_id_len.size() > 1 &&
+        buf_id_len.first != used_buffer_id_len.back().first)
       sqe->flags |= IOSQE_IO_LINK;
 
     // 请求信息——最后一个sqe的user_data需要need_resume_coroutine=true
-    IORequestInfo req_info{.fd = sock_fd_idx,
-                           .need_resume = (buf_id == used_buffer_id.back()),
-                           .type = SEND};
+    IORequestInfo req_info{
+        .fd = sock_fd_idx,
+        .need_resume = (buf_id_len.first == used_buffer_id_len.back().first),
+        .type = SEND};
     memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
   }
 
   // 提交
   Log::debug("add send request, sock_fd_idx=", sock_fd_idx,
-             "|used_buffer_id.size()=", used_buffer_id.size());
+             "|used_buffer_id_len.size()=", used_buffer_id_len.size());
   io_uring_submit(&ring);
 }
 
 // 关闭连接（提交close请求）
-void Worker::disconnect(int sock_fd_idx,
-                        ConnectionTask::CoroutineHandler handler) {
+void Worker::disconnect(int sock_fd_idx, ConnectionTaskHandler handler) {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
   FORCE_ASSERT(sqe != NULL);
 
@@ -134,29 +140,39 @@ bool Worker::try_extend_prov_buf() {
 
 // 获取buf
 void *Worker::get_write_buf(int buf_id) { return write_buffer_pool_[buf_id]; }
+
 void *Worker::get_prov_buf(int buf_id) { return read_buffer_pool_[buf_id]; }
 
 void Worker::send_to_client(
     int sock_fd_idx, std::list<boost::asio::const_buffer> &serialized_buffers,
-    std::list<int> &used_buffer_id, ConnectionTask::CoroutineHandler h,
-    bool &finish_send) {
+    std::list<std::pair<int, int>> &used_buffer_id_len, ConnectionTaskHandler h,
+    bool &finish_send, const std::map<const void *, int> &read_used_buf) {
   // 计算所需buffer字节数与所需页数
-  int msg_len = 0;
+  int need_page_num = 0, temp_msg_len = 0;
   for (auto buf : serialized_buffers) {
-    msg_len += buf.size();
+    // 通过`co_await file_read`已经写入write_buf的缓存
+    // 前面不足一块buf的以一块buf计算
+    if (read_used_buf.find(buf.data()) != read_used_buf.end()) {
+      need_page_num += (temp_msg_len + page_size - 1) / page_size;
+      temp_msg_len = 0;
+      continue;
+    }
+    // 不属于used_buf，则积累temp_msg_len
+    temp_msg_len += buf.size();
   }
-  int page_num = (msg_len + page_size - 1) / page_size;
+  need_page_num += (temp_msg_len + page_size - 1) / page_size;
 
   // buffer不足，尝试扩展
-  if (unused_write_buffer_id_.size() < page_num) {
+  if (unused_write_buffer_id_.size() < need_page_num) {
     // 可以扩展的buffer数量，不能超过max_buffer_num
-    int extend_buf_num = std::min(max_buffer_num_ - write_buffer_pool_.size(),
-                                  page_num - unused_write_buffer_id_.size());
+    int extend_buf_num =
+        std::min(max_buffer_num_ - write_buffer_pool_.size(),
+                 need_page_num - unused_write_buffer_id_.size());
     extend_write_buffer_pool(extend_buf_num);
   }
 
   // buffer足够，将serializer产生的buffer拷贝到wirte_buffer中
-  if (unused_write_buffer_id_.size() >= page_num) {
+  if (unused_write_buffer_id_.size() >= need_page_num) {
     int dest_start_pos = 0, src_start_pos = 0, buf_id = -1;
     auto it = serialized_buffers.begin();
     while (true) {
@@ -165,8 +181,38 @@ void Worker::send_to_client(
       assert(src_buf_remain_bytes >= 0);
       if (src_buf_remain_bytes == 0) {
         it++;
+        // 若该buffer为write_buf（只出现在body，因此不会在一开始出现）
+        if (read_used_buf.find(it->data()) != read_used_buf.end()) {
+          // 强行停止上一块write_buf（即使没有写满），保存buf和len
+          used_buffer_id_len.emplace_back(buf_id, dest_start_pos);
+          // 当前的write_buf直接进
+          used_buffer_id_len.emplace_back(read_used_buf.at(it->data()),
+                                          it->size());
+          // 下一块serialized buf
+          it++;
+          // 看是否结束，有时候如果使用chunked-encoding，就不会结束，后续还要继续发东西
+          if (it == serialized_buffers.end()) {
+            break;
+          }
+          // 更新src信息
+          src_start_pos = 0;
+
+          // 取下一块write_buf
+          buf_id = unused_write_buffer_id_.front();
+          unused_write_buffer_id_.pop();
+          // 更新dest信息
+          dest_start_pos = 0;
+
+          // 进入下一轮拷贝
+          continue;
+        }
+
         // 若已全部拷贝则退出循环
-        if (it == serialized_buffers.end()) break;
+        if (it == serialized_buffers.end()) {
+          // 写入最后一块write_buf，保存buf和len
+          used_buffer_id_len.emplace_back(buf_id, dest_start_pos);
+          break;
+        }
         // 更新remain bytes
         src_buf_remain_bytes = it->size();
         src_start_pos = 0;
@@ -175,12 +221,16 @@ void Worker::send_to_client(
       // 需要取下一块write buffer
       int dest_buf_remain_bytes = page_size - dest_start_pos;
       assert(dest_buf_remain_bytes >= 0);
+
       if (buf_id == -1 || dest_buf_remain_bytes == 0) {
+        // 写完完整的一页buffer，保存buf和len
+        if (dest_buf_remain_bytes == 0) {
+          used_buffer_id_len.emplace_back(buf_id, page_size);
+        }
         buf_id = unused_write_buffer_id_.front();
         unused_write_buffer_id_.pop();
         dest_buf_remain_bytes = page_size;
         dest_start_pos = 0;
-        used_buffer_id.push_back(buf_id);
         Log::debug("use write buffer id=", buf_id);
       }
 
@@ -193,14 +243,17 @@ void Worker::send_to_client(
       dest_start_pos += bytes_to_copy;
       src_start_pos += bytes_to_copy;
     }
+
+    assert(used_buffer_id_len.size() == need_page_num + read_used_buf.size());
+
     // 提交到io_uring，使用IOSQE_IO_LINK串联起来
-    add_zero_copy_send(sock_fd_idx, h, used_buffer_id, msg_len);
+    add_zero_copy_send(sock_fd_idx, h, used_buffer_id_len);
     finish_send = true;
     return;
   }
 
   // buffer不能扩展或者扩展后仍然不足，需要重新co_await调用该对象
-  if (unused_write_buffer_id_.size() < page_num) {
+  if (unused_write_buffer_id_.size() < need_page_num) {
     // 将本协程放入private_queue（涉及io_uring的提交均由private queue完成）
     // 等待后续resume()后，由协程再次co_await该对象
     add_io_resume_task(sock_fd_idx);
@@ -214,7 +267,7 @@ void Worker::send_to_client(
 
 int Worker::get_worker_id() { return self_worker_id_; }
 
-void Worker::add_process_task(ConnectionTask::CoroutineHandler h) {
+void Worker::add_process_task(ConnectionTaskHandler h) {
   if (ws_process_task_queue.push(h))
     Log::debug("add a process task to wsq");
   else
@@ -225,7 +278,7 @@ void Worker::add_io_resume_task(int sock_fd_idx) {
   private_io_task_queue.push(sock_fd_idx);
 }
 
-bool Worker::try_get_io_task_queue(ConnectionTask::CoroutineHandler &h) {
+bool Worker::try_get_io_task_queue(ConnectionTaskHandler &h) {
   // 空返回false
   if (private_io_task_queue.empty()) return false;
   // 非空设置协程句柄
@@ -240,12 +293,6 @@ void Worker::handle_accept(const struct io_uring_cqe *cqe) {
   int sock_fd_idx = cqe->res;
   // accept成功
   if (sock_fd_idx >= 0) {
-    // 函数前置声明
-    ConnectionTask handle_http_request(
-        int sock_fd_idx, std::function<int(http::request<http::string_body> &,
-                                           http::response<http::string_body> &)>
-                             processor);
-
     // fd记录还在，又accept了一个相同的fd
     if (connections_.count(sock_fd_idx)) {
       UtilError::error_exit(
@@ -261,7 +308,7 @@ void Worker::handle_accept(const struct io_uring_cqe *cqe) {
 
     // 设置worker
     // 后续该协程的所有IO操作都通过此worker完成，使用fixed file加速
-    connections_.at(sock_fd_idx).handler.promise().io_worker = this;
+    connections_.at(sock_fd_idx).handler.promise().net_io_worker = this;
     add_io_resume_task(sock_fd_idx);
   }
   // accept错误
@@ -271,8 +318,9 @@ void Worker::handle_accept(const struct io_uring_cqe *cqe) {
     if (cqe->res == -ENFILE) {
       UtilError::error_exit(
           "fixed file not enough, please set a higher fixed file num, "
-          "connections_num=" +
-              std::to_string(connections_.size()),
+          "current connections num=" +
+              std::to_string(connections_.size()) +
+              " max_fixed_file_num=" + std::to_string(max_fixed_file_num_),
           false);
     }
 
@@ -294,10 +342,7 @@ void Worker::handle_accept(const struct io_uring_cqe *cqe) {
 
 Worker::Worker(int max_conn_num, const std::string &ip, int port, int worker_id,
                int init_buffer_num, int max_buffer_num,
-               std::function<int(http::request<http::string_body> &,
-                                 http::response<http::string_body> &)>
-                   processor,
-               Service *service)
+               ProcessFuncType processor, Service *service)
     : max_conn_num_(max_conn_num),
       io_uring_entries_(2 * max_conn_num),
       max_fixed_file_num_(max_conn_num + 50),
@@ -405,11 +450,65 @@ Worker::Worker(int max_conn_num, const std::string &ip, int port, int worker_id,
   add_multishot_accept(listen_fd_);
 }
 
+// 提交read请求
+void Worker::add_read(int sock_fd_idx, int read_file_fd, int file_size,
+                      void **buf, int buf_idx) {
+  struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+  FORCE_ASSERT(sqe != NULL);
+
+  // 使用fixed buffer
+  if (buf_idx != -1) {
+    io_uring_prep_read_fixed(sqe, read_file_fd, *buf, file_size, 0, buf_idx);
+  }
+  // 使用temp buffer
+  else {
+    io_uring_prep_read(sqe, read_file_fd, *buf, file_size, 0);
+  }
+
+  // user data
+  IORequestInfo req_info{.fd = sock_fd_idx, .need_resume = true, .type = READ};
+  memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
+
+  // 提交
+  io_uring_submit(&ring);
+}
+
+// 读取文件
+void Worker::read_file(int sock_fd_idx, int read_file_fd, int &used_buffer_id,
+                       void **buf) {
+  // 获取file size
+  struct stat st;
+  if (fstat(read_file_fd, &st) == -1) {
+    UtilError::error_exit("failed to get file size, fd=", read_file_fd);
+  }
+  int file_size = st.st_size;
+
+  // write_buf可用，且page_num为1，使用write_buf，作为fixed_buffer可以加速
+  // io_uring 不支持 readv with fixed buffer
+  // 因此只在一块buffer能覆盖的情况下，使用fixed buffer
+  // 使用write_buffer_pool是为了后续直接发送给客户端
+  int page_num = (file_size + page_size - 1) / page_size;
+  if (page_num == 1 && unused_write_buffer_id_.size() > 0) {
+    // get buf
+    used_buffer_id = unused_write_buffer_id_.front();
+    unused_write_buffer_id_.pop();
+    *buf = write_buffer_pool_[used_buffer_id];
+    add_read(sock_fd_idx, read_file_fd, file_size, buf, used_buffer_id);
+  }
+  // write_buf不够，直接开辟内存
+  else {
+    used_buffer_id = -1;
+    *buf = new char[file_size];
+    // -1表示不使用fixed buffer，而使用temp buffer
+    add_read(sock_fd_idx, read_file_fd, file_size, buf, -1);
+  }
+}
+
 void Worker::run() {
   // 提交构造函数准备好的accept请求
   while (true) {
     bool have_task = false;
-    ConnectionTask::CoroutineHandler handler;
+    ConnectionTaskHandler handler;
     // 优先处理io task
     if (try_get_io_task_queue(handler)) {
       Log::debug("get a task from private worker_id=", self_worker_id_);
@@ -533,8 +632,14 @@ void Worker::run() {
         }
         case IOType::CLOSE: {
           copy_cqe(connections_.at(info.fd).handler.promise().cqe, *cqe);
-          // add_io_resume_task(info.fd);
+          // 此时需要立刻resume处理，不能入队列，保证先处理close，后处理accept
+          // 否则会出现bug：还没处理sock_fd_idx的close，就先处理sock_fd_idx的下一次accept
           connections_.at(info.fd).handler.resume();
+          break;
+        }
+        case IOType::READ: {
+          copy_cqe(connections_.at(info.fd).handler.promise().cqe, *cqe);
+          add_io_resume_task(info.fd);
           break;
         }
         // TODO: 优雅退出
@@ -551,18 +656,20 @@ void Worker::run() {
 
 // socket_recv
 bool socket_recv_awaitable::await_ready() { return false; }
-void socket_recv_awaitable::await_suspend(ConnectionTask::CoroutineHandler h) {
+
+void socket_recv_awaitable::await_suspend(ConnectionTaskHandler h) {
   // struct成员赋值
   handler = h;
-  io_worker = h.promise().io_worker;
+  net_io_worker = h.promise().net_io_worker;
 
   // 提交recv请求
   Log::debug("add recv at sock_fd_idx=", sock_fd_idx);
-  io_worker->add_recv(sock_fd_idx, h, true);
+  net_io_worker->add_recv(sock_fd_idx, h, true);
 
   // 设置IO状态
   h.promise().current_io = IOType::RECV;
 }
+
 // 返回是否已经完成
 // false-读取未完成，需要重新co_await调用
 // true-读取已经完成/解析出错，无需重新co_await调用
@@ -582,7 +689,7 @@ bool socket_recv_awaitable::await_resume() {
     // 把buffer丢进parser
     error_code err;
     parser.put(
-        boost::asio::buffer(io_worker->get_prov_buf(prov_buf_id), cqe.res),
+        boost::asio::buffer(net_io_worker->get_prov_buf(prov_buf_id), cqe.res),
         err);
     if (err) {
       Log::error("parse http request error", err.message());
@@ -590,7 +697,7 @@ bool socket_recv_awaitable::await_resume() {
     }
 
     // 由于parser内部会拷贝buffer内容，所以这里可以将占用的prov_buf进行回收
-    io_worker->retrive_prov_buf(prov_buf_id);
+    net_io_worker->retrive_prov_buf(prov_buf_id);
 
     // 数据没有读完，需要再次读取
     bool recv_finished;
@@ -638,7 +745,7 @@ bool socket_recv_awaitable::await_resume() {
   else if (cqe.res == -ENOBUFS) {
     Log::debug("recv failed for lack of provide buffer");
     // 扩展内存(如果未到上限)
-    io_worker->try_extend_prov_buf();
+    net_io_worker->try_extend_prov_buf();
     assert(!(cqe.flags & IORING_CQE_F_MORE));
     // 重试
     return false;
@@ -657,19 +764,22 @@ bool socket_recv_awaitable::await_resume() {
 
 // socket_send
 bool socket_send_awaitable::await_ready() { return false; }
-void socket_send_awaitable::await_suspend(ConnectionTask::CoroutineHandler h) {
+
+void socket_send_awaitable::await_suspend(ConnectionTaskHandler h) {
   handler = h;
-  io_worker = h.promise().io_worker;
-  io_worker->send_to_client(sock_fd_idx, serialized_buffers, used_buffer_id, h,
-                            finish_send);
+  net_io_worker = h.promise().net_io_worker;
+  net_io_worker->send_to_client(sock_fd_idx, serialized_buffers,
+                                used_buffer_id_len, h, finish_send,
+                                read_used_buf);
   h.promise().current_io = IOType::SEND;
 }
+
 // 返回是否已经完成
 // false-写入未完成，需要重新co_await调用
 // true-写入已经完成
 bool socket_send_awaitable::await_resume() {
   // 要么buffer不够没完成，要么占用了buffer然后完成
-  assert(!finish_send || !used_buffer_id.empty());
+  assert(!finish_send || !used_buffer_id_len.empty());
 
   auto &promise = handler.promise();
   struct coroutine_cqe &cqe = promise.cqe;
@@ -685,8 +795,8 @@ bool socket_send_awaitable::await_resume() {
 
   // 发送成功，回收内存
   if (cqe.res >= 0) {
-    for (auto buf_id : used_buffer_id) {
-      io_worker->retrive_write_buf(buf_id);
+    for (auto buf_id_len : used_buffer_id_len) {
+      net_io_worker->retrive_write_buf(buf_id_len.first);
     }
   }
   // 其他错误直接放弃，直接disconnect
@@ -699,7 +809,8 @@ bool socket_send_awaitable::await_resume() {
 
 // 提交close请求
 bool socket_close_awaitable::await_ready() { return false; }
-void socket_close_awaitable::await_suspend(ConnectionTask::CoroutineHandler h) {
+
+void socket_close_awaitable::await_suspend(ConnectionTaskHandler h) {
   handler = h;
   auto &promise = h.promise();
 
@@ -707,10 +818,11 @@ void socket_close_awaitable::await_suspend(ConnectionTask::CoroutineHandler h) {
   promise.current_io = IOType::CLOSE;
 
   // 关闭连接
-  Worker *io_worker = promise.io_worker;
-  io_worker->disconnect(sock_fd_idx, h);
+  Worker *net_io_worker = promise.net_io_worker;
+  net_io_worker->disconnect(sock_fd_idx, h);
   Log::debug("submit socket close IO request, sock_fd_idx=", sock_fd_idx);
 }
+
 void socket_close_awaitable::await_resume() {
   auto &promise = handler.promise();
   struct coroutine_cqe &cqe = promise.cqe;
@@ -719,7 +831,7 @@ void socket_close_awaitable::await_resume() {
   FORCE_ASSERT(promise.current_io == IOType::CLOSE);
   promise.current_io = IOType::NONE;
 
-  promise.io_worker->connections_.erase(sock_fd_idx);
+  promise.net_io_worker->connections_.erase(sock_fd_idx);
 
   if (cqe.res < 0)
     UtilError::error_exit(
@@ -730,51 +842,85 @@ void socket_close_awaitable::await_resume() {
 // add current coroutine to work-stealing queue
 // 将当前协程添加到ws队列（本地满了就加global），可以被其他线程偷窃
 bool add_process_task_to_wsq_awaitable::await_ready() { return false; }
-void add_process_task_to_wsq_awaitable::await_suspend(
-    ConnectionTask::CoroutineHandler h) {
+
+void add_process_task_to_wsq_awaitable::await_suspend(ConnectionTaskHandler h) {
   handler = h;
-  Worker *io_worker = h.promise().io_worker;
-  io_worker->add_process_task(h);
+  Worker *net_io_worker = h.promise().net_io_worker;
+  net_io_worker->add_process_task(h);
 }
+
 void add_process_task_to_wsq_awaitable::await_resume() {}
 
-// add current coroutine to io_worker private io task queue
+// add current coroutine to net_io_worker private io task queue
 // 其他worker偷窃协程，处理完process()任务后，将协程的执行权交还给io_worker
 bool add_io_task_back_to_io_worker_awaitable::await_ready() { return false; }
+
 bool add_io_task_back_to_io_worker_awaitable::await_suspend(
-    ConnectionTask::CoroutineHandler h) {
-  Worker *io_worker = h.promise().io_worker;
+    ConnectionTaskHandler h) {
+  Worker *net_io_worker = h.promise().net_io_worker;
   Worker *process_worker = h.promise().process_worker;
 
   // 同一个worker，不用挂起了，直接继续执行
-  if (io_worker->get_worker_id() == process_worker->get_worker_id()) {
-    assert(io_worker == process_worker);
+  if (net_io_worker->get_worker_id() == process_worker->get_worker_id()) {
+    assert(net_io_worker == process_worker);
     Log::debug(
-        "the io_worker and process_worker is the same worker, no need to "
+        "the net_io_worker and process_worker is the same worker, no need to "
         "suspend, worker_id=",
-        io_worker->get_worker_id());
+        net_io_worker->get_worker_id());
     // 恢复协程
     return false;
   }
   // 不同worker，需要加入队列
   else {
-    io_worker->add_io_resume_task(sock_fd_idx);
-    Log::debug("add io_task back to io_worker=", io_worker->get_worker_id(),
-               ", process_worker=", process_worker->get_worker_id());
+    net_io_worker->add_io_resume_task(sock_fd_idx);
+    Log::debug(
+        "add io_task back to net_io_worker=", net_io_worker->get_worker_id(),
+        ", process_worker=", process_worker->get_worker_id());
     // 挂起协程
     return true;
   }
 }
+
 void add_io_task_back_to_io_worker_awaitable::await_resume() {}
 
-ConnectionTask handle_http_request(
-    int sock_fd_idx, std::function<int(http::request<http::string_body> &,
-                                       http::response<http::string_body> &)>
-                         processor) {
+bool file_read_awaitable::await_ready() { return false; }
+
+// 返回：true-完成，false-未完成
+void file_read_awaitable::await_suspend(ConnectionTaskHandler h) {
+  net_io_worker = h.promise().net_io_worker;
+  handler = h;
+  h.promise().current_io = IOType::READ;
+  // 读取文件
+  net_io_worker->read_file(sock_fd_idx, read_file_fd, used_buffer_id, buf);
+}
+
+void file_read_awaitable::await_resume() {
+  // 恢复状态
+  FORCE_ASSERT(handler.promise().current_io == IOType::READ);
+  handler.promise().current_io = NONE;
+
+  auto cqe = handler.promise().cqe;
+  if (cqe.res < 0) {
+    UtilError::error_exit(
+        "read file failed, sock_fd_idx=" + std::to_string(sock_fd_idx) +
+            "cqe.res=" + std::to_string(cqe.res),
+        false);
+  }
+
+  bytes_num = cqe.res;
+  Log::debug("read file finish, sock_fd_idx=", sock_fd_idx,
+             "|read_file_fd=", read_file_fd, "cqe.res=", cqe.res);
+
+  // 此时还不能删除buffer或者回收buffer，因为后续需要使用该buffer进行send操作
+}
+
+ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor) {
   while (true) {
-    // 读取数据
+    // 初始化parser
     http::request_parser<http::string_body> parser;
     parser.eager(true);
+
+    // 读取数据
     bool finish_read = false;
     auto recv_awaitable = socket_recv(sock_fd_idx, parser);
     while (!finish_read) {
@@ -798,41 +944,92 @@ ConnectionTask handle_http_request(
     co_await add_process_task_to_wsq();
 
     // 构造response
-    http::response<http::string_body> response;
     http::request<http::string_body> request;
+    ResponseType response;
+
+    // processor参数
+    struct process_func_args args;
 
     // 完成解析
     bool bad_request = !parser.is_done();
     if (!bad_request) {
       request = parser.release();
-      processor(request, response);
-      response.prepare_payload();
+      processor(request, response, args);
     }
     // 解析失败
     else {
+      Log::debug(
+          "failed to process http "
+          "request|is_header_done|content_length|remain_content_length|",
+          parser.is_header_done(), "|", parser.content_length(), "|",
+          parser.content_length_remaining());
       // 构造一个bad request报文
-      response.result(http::status::bad_request);
-      response.set(http::field::content_type, "text/html");
-      response.keep_alive(false);
-      response.body() = "bad request: error while parsing http request";
-      response.prepare_payload();
+      response = http::response<http::string_body>{};
+      auto &res = std::get<http::response<http::string_body>>(response);
+      res.result(http::status::bad_request);
+      res.set(http::field::content_type, "text/html");
+      res.keep_alive(false);
+      res.body() = "bad request: error while parsing http request";
+    }
+
+    // 将控制权交还给io_worker
+    co_await add_io_task_back_to_io_worker(sock_fd_idx);
+
+    // 记录web server用于读取文件数据的buffer
+    std::map<const void *, int> used_buf;
+    // process函数要求当前请求以web server方式处理
+    if (args.use_web_server) {
+      response = http::response<http::buffer_body>{};
+      auto &res_buf = std::get<http::response<http::buffer_body>>(response);
+      res_buf.set(http::field::content_type, "text/html");
+
+      // open file
+      int fd = open(args.file_path.c_str(), O_RDONLY);
+
+      // open failed
+      if (fd == -1) {
+        Log::debug("open file failed with file_path=", args.file_path,
+                   " reason: ", strerror(errno));
+        res_buf.version(request.version());
+        res_buf.result(http::status::not_found);
+        res_buf.body().data = NULL;
+        res_buf.body().size = 0;
+        res_buf.body().more = false;
+      }
+      // open sucess
+      else {
+        // read file
+        int bytes_num = -1, used_buffer_id = -1;
+        void *buf = NULL;
+        co_await file_read(sock_fd_idx, fd, &buf, used_buffer_id, bytes_num);
+        used_buf[buf] = used_buffer_id;
+
+        // header
+        res_buf.version(request.version());
+        res_buf.result(http::status::ok);
+
+        // body
+        res_buf.body().data = buf;
+        res_buf.body().size = bytes_num;
+        res_buf.body().more = false;
+      }
     }
 
     // 序列化response
     std::list<boost::asio::const_buffer> buffers;
-    http::response_serializer<http::string_body> sr(response);
     error_code ec;
-    do {
-      sr.next(ec, [&sr, &buffers](error_code &ec, auto const &buffer) {
-        ec.assign(0, ec.category());
-        for (auto it = buffer.begin(); it != buffer.end(); it++)
-          buffers.push_back(*it);
-        sr.consume(boost::asio::buffer_size(buffer));
-      });
-    } while (!ec && !sr.is_done());
+    int data_to_consume = 0;
+    // 为了减少拷贝次数，serializer需要在闭包外初始化，等后续在consume
+    SerializerType serializer;
 
-    // 将控制权交还给io_worker
-    co_await add_io_task_back_to_io_worker(sock_fd_idx);
+    std::visit(
+        [&](auto &res) {
+          res.prepare_payload();
+          using BodyType = typename std::decay_t<decltype(res)>::body_type;
+          serializer.emplace<http::response_serializer<BodyType>>(res);
+          serialize(serializer, buffers, ec, data_to_consume);
+        },
+        response);
 
     if (ec) {
       Log::debug(ec.message());
@@ -842,14 +1039,40 @@ ConnectionTask handle_http_request(
 
     // 返回数据给客户端
     bool finish_send = false, send_error_occurs = false;
-    auto awaitable_send = socket_send(sock_fd_idx, buffers, send_error_occurs);
+    auto awaitable_send =
+        socket_send(sock_fd_idx, buffers, send_error_occurs, used_buf);
     while (!finish_send) {
       Log::debug("co_await awaitable_send with sock_fd_idx=", sock_fd_idx);
       finish_send = co_await awaitable_send;
     }
 
+    // 清理process使用的内存，write_buf_id=-1就删除
+    // write_buf_id=-1说明不是write buf pool的
+    for (auto it : used_buf) {
+      if (it.second == -1) {
+        delete (char *)const_cast<void *>(it.first);
+      }
+    }
+
+    // 清理serializer数据
+    std::visit(
+        [=](auto &sr) {
+          using T = std::decay_t<decltype(sr)>;
+          // std::monostate类型直接报错
+          if constexpr (std::is_same_v<T, std::monostate>) {
+            FORCE_ASSERT(false);
+          }
+          // consume
+          else {
+            sr.consume(data_to_consume);
+          }
+        },
+        serializer);
+
     // 断开连接
-    if (send_error_occurs || !request.keep_alive() || !response.keep_alive()) {
+    bool keep_alive =
+        std::visit([](auto &res) { return res.keep_alive(); }, response);
+    if (send_error_occurs || !request.keep_alive() || !keep_alive) {
       Log::debug("close socket");
       co_await socket_close(sock_fd_idx);
       co_return 0;
@@ -859,9 +1082,7 @@ ConnectionTask handle_http_request(
 
 Service::Service(int worker_num, int max_conn_num, const std::string &ip,
                  int port, int init_buffer_num, int max_buffer_num,
-                 std::function<int(http::request<http::string_body> &,
-                                   http::response<http::string_body> &)>
-                     http_handler)
+                 ProcessFuncType http_handler)
     : worker_num(worker_num), global_queue(100) {
   // 初始化worker
   FORCE_ASSERT(worker_num > 0);
@@ -905,12 +1126,13 @@ socket_recv_awaitable socket_recv(
   return socket_recv_awaitable{.sock_fd_idx = sock_fd_idx, .parser = parser};
 }
 
-socket_send_awaitable socket_send(int sock_fd_idx,
-                                  std::list<boost::asio::const_buffer> &buffers,
-                                  bool &send_error_occurs) {
+socket_send_awaitable socket_send(
+    int sock_fd_idx, std::list<boost::asio::const_buffer> &buffers,
+    bool &send_error_occurs, const std::map<const void *, int> &read_used_buf) {
   return socket_send_awaitable{.sock_fd_idx = sock_fd_idx,
                                .send_error_occurs = send_error_occurs,
-                               .serialized_buffers = buffers};
+                               .serialized_buffers = buffers,
+                               .read_used_buf = read_used_buf};
 }
 
 socket_close_awaitable socket_close(int sock_fd_idx) {
@@ -924,4 +1146,55 @@ add_process_task_to_wsq_awaitable add_process_task_to_wsq() {
 add_io_task_back_to_io_worker_awaitable add_io_task_back_to_io_worker(
     int sock_fd_idx) {
   return add_io_task_back_to_io_worker_awaitable{.sock_fd_idx = sock_fd_idx};
+}
+
+file_read_awaitable file_read(int sock_fd_idx, int read_file_fd, void **buf,
+                              int &used_buffer_id, int &bytes_num) {
+  return file_read_awaitable{.sock_fd_idx = sock_fd_idx,
+                             .read_file_fd = read_file_fd,
+                             .buf = buf,
+                             .used_buffer_id = used_buffer_id,
+                             .bytes_num = bytes_num};
+}
+
+void serialize(SerializerType &sr,
+               std::list<boost::asio::const_buffer> &buffers, error_code &ec,
+               int &data_to_consume) {
+  // 先初始化
+
+  // 序列化
+  auto visit_func = [&buffers, &ec, &data_to_consume](auto &sr) {
+    using T = std::decay_t<decltype(sr)>;
+    // std::monostate类型直接报错
+    if constexpr (std::is_same_v<T, std::monostate>) {
+      FORCE_ASSERT(false);
+    }
+    // 其他类型：进行序列化
+    else {
+      data_to_consume = 0;
+      bool is_finish = false;
+      do {
+        sr.next(ec, [&](error_code &ec, auto const &buffer) {
+          // hack: 不consume的话，next会循环输出，遇到一样的说明结束了
+          // 通过这种方式避免一次数据拷贝，等到拷贝到write_buf发送完再consume
+          boost::asio::const_buffer buf = *buffer.begin();
+          if (buffers.front().data() == buf.data()) {
+            Log::debug("get same buf with next()",
+                       ", this means that the serialization is done.");
+            is_finish = true;
+            return;
+          }
+
+          ec.assign(0, ec.category());
+          for (auto it = buffer.begin(); it != buffer.end(); it++) {
+            buffers.push_back(*it);
+          }
+          data_to_consume += boost::asio::buffer_size(buffer);
+          // sr.consume(boost::asio::buffer_size(buffer));
+        });
+      } while (!ec && !sr.is_done() && !is_finish);
+    };
+  };
+
+  std::visit(visit_func, sr);
 }

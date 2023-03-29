@@ -10,6 +10,8 @@
 #include <queue>
 
 // #include <boost/beast/http.hpp>
+#include <boost/beast/http/buffer_body.hpp>
+#include <boost/beast/http/empty_body.hpp>
 #include <boost/beast/http/parser.hpp>
 #include <boost/beast/http/serializer.hpp>
 #include <boost/beast/http/string_body.hpp>
@@ -18,6 +20,7 @@
 #include <list>
 #include <mutex>
 #include <thread>
+#include <variant>
 #include <vector>
 
 #include "log.h"
@@ -25,7 +28,7 @@
 
 using namespace boost::beast;
 
-enum IOType : uint8_t { ACCEPT, RECV, SEND, CLOSE, SHUTDOWN, NONE };
+enum IOType : uint8_t { ACCEPT, RECV, SEND, CLOSE, SHUTDOWN, NONE, READ };
 
 // cqe的柔性数组在c++20协程中会出问题
 // 因此定义一个没有柔性数组的cqe，在协程中使用
@@ -33,7 +36,6 @@ struct coroutine_cqe {
   __u64 user_data; /* sqe->data submission passed back */
   __s32 res;       /* result code for this event */
   __u32 flags;
-  IOType type;
 };
 
 struct IORequestInfo;
@@ -47,7 +49,7 @@ struct ConnectionTask {
 
     // 负责当前io的worker，在accept后设置，为了使用fixed
     // file特性，协程的recv与send均由该worker完成
-    Worker *io_worker = NULL;
+    Worker *net_io_worker = NULL;
     // 负责process任务的worker，可能与io_worker不同
     Worker *process_worker = NULL;
 
@@ -60,31 +62,44 @@ struct ConnectionTask {
    public:
     // 协程在开始执行之前会调用该方法，返回协程句柄
     auto get_return_object() {
-      return ConnectionTask{CoroutineHandler::from_promise(*this)};
+      return ConnectionTask{
+          std::coroutine_handle<promise_type>::from_promise(*this)};
     }
     // co_return返回值设置
     void return_value(int ret) { this->ret = ret; }
     // 协程初始化时挂起
-    std::suspend_always initial_suspend() noexcept { return {}; }
+    auto initial_suspend() noexcept { return std::suspend_always{}; }
     // destroy时立即销毁协程
-    std::suspend_never final_suspend() noexcept { return {}; }
+    auto final_suspend() noexcept { return std::suspend_never{}; }
     // 处理异常
-    void unhandled_exception() {
-#ifdef PRODUCTION
-      Log::error("xxxxx");
-#else
-      std::terminate();
-#endif
-    }
+    void unhandled_exception() { std::terminate(); }
   };
 
- public:
-  using CoroutineHandler = std::coroutine_handle<promise_type>;
-  CoroutineHandler handler;  // 协程句柄
-
- public:
-  ConnectionTask(CoroutineHandler handler) : handler(handler) {}
+  std::coroutine_handle<promise_type> handler;  // 协程句柄
+  ConnectionTask(std::coroutine_handle<promise_type> handler)
+      : handler(handler) {}
 };
+
+using ConnectionTaskHandler =
+    typename std::coroutine_handle<typename ConnectionTask::promise_type>;
+using ResponseType = std::variant<http::response<http::string_body>,
+                                  http::response<http::buffer_body>>;
+
+using SerializerType =
+    std::variant<std::monostate,
+    http::response_serializer<http::string_body>,
+                 http::response_serializer<http::buffer_body>>;
+
+// process函数的参数
+struct process_func_args {
+  // 以web server方式处理，以及响应的文件路径
+  bool use_web_server = false;
+  std::string file_path;
+};
+
+using ProcessFuncType =
+    std::function<int(http::request<http::string_body> &, ResponseType &,
+                      process_func_args &args)>;
 
 struct IORequestInfo {
   int fd;
@@ -102,16 +117,17 @@ struct socket_recv_awaitable {
   int sock_fd_idx;                                  // 读数据socket
   http::request_parser<http::string_body> &parser;  // http parser
 
-  ConnectionTask::CoroutineHandler handler;
-  Worker *io_worker;
+  ConnectionTaskHandler handler;
+  Worker *net_io_worker;
 
   bool await_ready();
-  void await_suspend(ConnectionTask::CoroutineHandler h);
+  void await_suspend(ConnectionTaskHandler h);
   // 返回是否已经完成
   // false-读取未完成，需要重新co_await调用
   // true-读取已经完成/解析出错，无需重新co_await调用
   bool await_resume();
 };
+
 socket_recv_awaitable socket_recv(
     int sock_fd_idx, http::request_parser<http::string_body> &parser);
 
@@ -129,30 +145,34 @@ struct socket_send_awaitable {
   std::list<boost::asio::const_buffer> &serialized_buffers;
 
   // 记录被用于send的buffer id，后续需要回收
-  std::list<int> used_buffer_id;
+  std::list<std::pair<int, int>> used_buffer_id_len;
 
-  Worker *io_worker = NULL;
-  ConnectionTask::CoroutineHandler handler;
+  const std::map<const void *, int> &read_used_buf;
+
+  Worker *net_io_worker = NULL;
+  ConnectionTaskHandler handler;
 
   bool await_ready();
-  void await_suspend(ConnectionTask::CoroutineHandler h);
+  void await_suspend(ConnectionTaskHandler h);
 
   // 返回是否已经完成
   // false-写入未完成，需要重新co_await调用
   // true-写入已经完成
   bool await_resume();
 };
+
 socket_send_awaitable socket_send(int sock_fd_idx,
                                   std::list<boost::asio::const_buffer> &buffers,
-                                  bool &send_error_occurs);
+                                  bool &send_error_occur,
+                                  const std::map<const void *, int> &used_buf);
 
 // socket_close
 struct socket_close_awaitable {
   int sock_fd_idx;
-  ConnectionTask::CoroutineHandler handler;
+  ConnectionTaskHandler handler;
   bool await_ready();
   // 提交close请求
-  void await_suspend(ConnectionTask::CoroutineHandler h);
+  void await_suspend(ConnectionTaskHandler h);
   void await_resume();
 };
 socket_close_awaitable socket_close(int sock_fd_idx);
@@ -160,27 +180,52 @@ socket_close_awaitable socket_close(int sock_fd_idx);
 // add current coroutine to work-stealing queue
 // 将当前协程添加到ws队列（本地满了就加global），可以被其他线程偷窃
 struct add_process_task_to_wsq_awaitable {
-  ConnectionTask::CoroutineHandler handler;
+  ConnectionTaskHandler handler;
   bool await_ready();
-  void await_suspend(ConnectionTask::CoroutineHandler h);
+  void await_suspend(ConnectionTaskHandler h);
   void await_resume();
 };
 add_process_task_to_wsq_awaitable add_process_task_to_wsq();
 
-// add current coroutine to io_worker private io task queue
+// add current coroutine to net_io_worker private io task queue
 // 其他worker偷窃协程，处理完process()任务后，将协程的执行权交还给io_worker
 struct add_io_task_back_to_io_worker_awaitable {
   int sock_fd_idx;
   bool await_ready();
-  bool await_suspend(ConnectionTask::CoroutineHandler h);
+  bool await_suspend(ConnectionTaskHandler h);
   void await_resume();
 };
-add_io_task_back_to_io_worker_awaitable add_io_task_back_to_io_worker(int sock_fd_idx);
+add_io_task_back_to_io_worker_awaitable add_io_task_back_to_io_worker(
+    int sock_fd_idx);
 
-ConnectionTask handle_http_request(
-    int sock_fd_idx, std::function<int(http::request<http::string_body> &,
-                                       http::response<http::string_body> &)>
-                         processor);
+// 读取磁盘文件
+struct file_read_awaitable {
+  int sock_fd_idx;
+  int read_file_fd;
+  // 读取文件使用的buffer：fixed buffer或者temp buffer
+  void **buf;
+  // used_buffer_id=-1，表示使用temp buffer，否则为write buffer
+  int &used_buffer_id;
+  // 读取buffer大小
+  int &bytes_num;
+
+  // read、write操作发生在io_worker中
+  Worker *net_io_worker = NULL;
+  ConnectionTaskHandler handler;
+
+  bool await_ready();
+  void await_suspend(ConnectionTaskHandler h);
+  void await_resume();
+};
+// 读取磁盘文件
+file_read_awaitable file_read(int sock_fd_idx, int read_file_fd, void **buf,
+                              int &used_buffer_id, int &bytes_num);
+
+ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor);
+
+void serialize(SerializerType &sr,
+               std::list<boost::asio::const_buffer> &buffers, error_code &ec,
+               int &data_to_consume);
 
 class Service {
  private:
@@ -188,15 +233,13 @@ class Service {
   std::vector<Worker *> workers;
   std::vector<std::thread> threads;
   // 全局process任务队列
-  boost::lockfree::queue<ConnectionTask::CoroutineHandler> global_queue;
+  boost::lockfree::queue<ConnectionTaskHandler> global_queue;
   friend Worker;
 
  public:
   Service(int worker_num, int max_conn_num, const std::string &ip, int port,
           int init_buffer_num, int max_buffer_num,
-          std::function<int(http::request<http::string_body> &,
-                            http::response<http::string_body> &)>
-              http_handler);
+          ProcessFuncType http_handler);
   ~Service();
 
   void start();
@@ -233,7 +276,7 @@ class Worker {
 
   // work stealing任务队列，结构无锁，可被其他worker访问
   // 只装process任务
-  boost::lockfree::queue<ConnectionTask::CoroutineHandler,
+  boost::lockfree::queue<ConnectionTaskHandler,
                          boost::lockfree::fixed_sized<true>>
       ws_process_task_queue;
 
@@ -244,9 +287,7 @@ class Worker {
   struct io_uring ring;
 
   // http处理器
-  std::function<int(http::request<http::string_body> &,
-                    http::response<http::string_body> &)>
-      processor_;
+  ProcessFuncType processor_;
 
   // 各awaitable对象的友元声明
   friend socket_recv_awaitable;
@@ -254,19 +295,20 @@ class Worker {
   friend socket_close_awaitable;
   friend add_process_task_to_wsq_awaitable;
   friend add_io_task_back_to_io_worker_awaitable;
+  friend file_read_awaitable;
 
  private:
   // 提交multishot_accept请求
   void add_multishot_accept(int listen_fd);
   // 提交multishot_recv请求
-  void add_recv(int sock_fd_idx, ConnectionTask::CoroutineHandler handler,
+  void add_recv(int sock_fd_idx, ConnectionTaskHandler handler,
                 bool poll_first);
   // 提交send_zc请求
-  void add_zero_copy_send(int sock_fd_idx,
-                          ConnectionTask::CoroutineHandler handler,
-                          std::list<int> used_buffer_id, int msg_len);
+  void add_zero_copy_send(
+      int sock_fd_idx, ConnectionTaskHandler handler,
+      const std::list<std::pair<int, int>> &used_buffer_id_len);
   // 关闭连接（提交close请求）
-  void disconnect(int sock_fd_idx, ConnectionTask::CoroutineHandler handler);
+  void disconnect(int sock_fd_idx, ConnectionTaskHandler handler);
   // 扩展写缓存池
   void extend_write_buffer_pool(int extend_buf_num);
   // 回收prov_buf
@@ -281,25 +323,31 @@ class Worker {
   // 将序列化后的buffer发送给客户端
   void send_to_client(int sock_fd_idx,
                       std::list<boost::asio::const_buffer> &serialized_buffers,
-                      std::list<int> &used_buffer_id,
-                      ConnectionTask::CoroutineHandler h, bool &finish_send);
+                      std::list<std::pair<int, int>> &used_buffer_id_len,
+                      ConnectionTaskHandler h, bool &finish_send,
+                      const std::map<const void *, int> &read_used_buf);
   int get_worker_id();
   // 添加process任务至work-stealing-queue
-  void add_process_task(ConnectionTask::CoroutineHandler h);
-  // 添加IO恢复任务至private-io-queue 
+  void add_process_task(ConnectionTaskHandler h);
+  // 添加IO恢复任务至private-io-queue
   void add_io_resume_task(int sock_fd_idx);
   // 获取io resume task
-  bool try_get_io_task_queue(ConnectionTask::CoroutineHandler &h);
+  bool try_get_io_task_queue(ConnectionTaskHandler &h);
   // 处理accept请求
   void handle_accept(const struct io_uring_cqe *cqe);
+  // 提交read请求
+  void add_read(int sock_fd_idx, int read_file_fd, int file_size, void **buf,
+                int buf_idx);
+  // 读取文件
+  void read_file(int sock_fd_idx, int read_file_fd, int &used_buffer_id,
+                 void **buf);
 
  public:
+  // web framework mode
   Worker(int max_conn_num, const std::string &ip, int port, int worker_id,
-         int init_buffer_num, int max_buffer_num,
-         std::function<int(http::request<http::string_body> &,
-                           http::response<http::string_body> &)>
-             processor,
+         int init_buffer_num, int max_buffer_num, ProcessFuncType processor,
          Service *service);
+
   void run();
 };
 
