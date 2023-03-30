@@ -1,5 +1,5 @@
-!bin/app.conf
-bin/
+bin/*
+!bin/catplusplus.config
 .vscode/
 .clangd/
 .cache/

@@ -9,4 +9,4 @@ void serialize(SerializerType &sr,
 
 ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor);
 
-#endif  // __HTTP_H__
+#endif // __HTTP_H__

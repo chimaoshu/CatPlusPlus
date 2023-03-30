@@ -27,11 +27,21 @@
 
 using namespace boost::beast;
 
-enum IOType : uint8_t { ACCEPT, RECV, SEND, CLOSE, SHUTDOWN, NONE, READ };
+enum IOType : uint8_t
+{
+  ACCEPT,
+  RECV,
+  SEND,
+  CLOSE,
+  SHUTDOWN,
+  NONE,
+  READ
+};
 
 // cqe的柔性数组在c++20协程中会出问题
 // 因此定义一个没有柔性数组的cqe，在协程中使用
-struct coroutine_cqe {
+struct coroutine_cqe
+{
   __u64 user_data; /* sqe->data submission passed back */
   __s32 res;       /* result code for this event */
   __u32 flags;
@@ -39,10 +49,12 @@ struct coroutine_cqe {
 
 struct IORequestInfo;
 class Worker;
-struct ConnectionTask {
- public:
-  struct promise_type {
-   public:
+struct ConnectionTask
+{
+public:
+  struct promise_type
+  {
+  public:
     // 返回值，见errno.h
     int ret;
 
@@ -58,9 +70,10 @@ struct ConnectionTask {
     // 当前正在进行的IO
     IOType current_io = IOType::NONE;
 
-   public:
+  public:
     // 协程在开始执行之前会调用该方法，返回协程句柄
-    auto get_return_object() {
+    auto get_return_object()
+    {
       return ConnectionTask{
           std::coroutine_handle<promise_type>::from_promise(*this)};
     }
@@ -74,7 +87,7 @@ struct ConnectionTask {
     void unhandled_exception() { std::terminate(); }
   };
 
-  std::coroutine_handle<promise_type> handler;  // 协程句柄
+  std::coroutine_handle<promise_type> handler; // 协程句柄
   ConnectionTask(std::coroutine_handle<promise_type> handler)
       : handler(handler) {}
 };
@@ -90,7 +103,8 @@ using SerializerType =
                  http::response_serializer<http::buffer_body>>;
 
 // process函数的参数
-struct process_func_args {
+struct process_func_args
+{
   // 以web server方式处理，以及响应的文件路径
   bool use_web_server = false;
   std::string file_path;
@@ -102,7 +116,8 @@ using ProcessFuncType =
     std::function<int(http::request<http::string_body> &, ResponseType &,
                       process_func_args &args)>;
 
-struct IORequestInfo {
+struct IORequestInfo
+{
   int fd;
   // 对于使用io_link串联的写请求来说，中间的cqe不需要恢复协程，只有最后一个cqe出现时才恢复协程
   bool need_resume;
@@ -113,8 +128,9 @@ struct IORequestInfo {
 // 拷贝cqe
 void copy_cqe(struct coroutine_cqe &dest, struct io_uring_cqe &src);
 
-class Service {
- private:
+class Service
+{
+private:
   const int worker_num;
   std::vector<Worker *> workers;
   std::vector<std::thread> threads;
@@ -122,26 +138,25 @@ class Service {
   boost::lockfree::queue<ConnectionTaskHandler> global_queue;
   friend Worker;
 
- public:
-  Service(int worker_num, int max_conn_num, const std::string &ip, int port,
-          int init_buffer_num, int max_buffer_num,
-          ProcessFuncType http_handler);
+public:
+  Service(int worker_num, ProcessFuncType http_handler);
   ~Service();
 
   void start();
 };
 
-class Worker {
- private:
-  const int max_conn_num_;                      // 最大连接数
-  const int io_uring_entries_;                  // io_uring sqe容量
-  const int max_fixed_file_num_;                // 最大注册文件数
-  const int max_buffer_num_;                    // 最大缓存数
-  const int self_worker_id_;                    // 工作线程唯一标识符
-  const int page_size = sysconf(_SC_PAGESIZE);  // 系统页大小，作为缓存大小
+class Worker
+{
+private:
+  const int max_conn_num_;                     // 最大连接数
+  const int io_uring_entries_;                 // io_uring sqe容量
+  const int max_fixed_file_num_;               // 最大注册文件数
+  const int max_buffer_num_;                   // 最大缓存数
+  const int self_worker_id_;                   // 工作线程唯一标识符
+  const int page_size = sysconf(_SC_PAGESIZE); // 系统页大小，作为缓存大小
 
-  std::vector<void *> read_buffer_pool_;   // 缓存池
-  std::vector<void *> write_buffer_pool_;  // 缓存池
+  std::vector<void *> read_buffer_pool_;  // 缓存池
+  std::vector<void *> write_buffer_pool_; // 缓存池
 
   // 未使用的写缓存id，由于send只会由本工作线程提交，因此此处串行无锁，无需与log一样使用lock-free-queue
   std::queue<int> unused_write_buffer_id_;
@@ -183,7 +198,7 @@ class Worker {
   friend struct add_io_task_back_to_io_worker_awaitable;
   friend struct file_read_awaitable;
 
- private:
+private:
   // 提交multishot_accept请求
   void add_multishot_accept(int listen_fd);
   // 提交multishot_recv请求
@@ -228,13 +243,10 @@ class Worker {
   void read_file(int sock_fd_idx, int read_file_fd, int &used_buffer_id,
                  void **buf);
 
- public:
-  // web framework mode
-  Worker(int max_conn_num, const std::string &ip, int port, int worker_id,
-         int init_buffer_num, int max_buffer_num, ProcessFuncType processor,
-         Service *service);
+public:
+  Worker(int worker_id, ProcessFuncType processor, Service *service);
 
   void run();
 };
 
-#endif  // __WORKER_H__
+#endif // __WORKER_H__

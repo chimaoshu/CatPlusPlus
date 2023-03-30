@@ -2,7 +2,8 @@
 
 // 格式化为日志格式
 void Logger::format_str(const std::string &type, const std::string &msg,
-                        std::string &result) {
+                        std::string &result)
+{
   // 获取时间
   time_t now = time(0);
   char *time_cstr = ctime(&now);
@@ -15,7 +16,8 @@ void Logger::format_str(const std::string &type, const std::string &msg,
   std::stringstream ss;
   ss << "[" << type << "][" << time_str << "]"
      << "[" << pthread_self() << "]" << msg;
-  if (msg.back() != '\n') ss << "\n";
+  if (msg.back() != '\n')
+    ss << "\n";
   result = ss.str();
 }
 
@@ -23,11 +25,13 @@ void Logger::format_str(const std::string &type, const std::string &msg,
 // 当该函数在被log函数调用时，只有抢到锁的线程会调用，因此安全
 // 当该函数在析构函数调用时，不存在多线程竞争，因此安全
 // 因此无需上SQ锁
-void Logger::io_uring_prep_submit_task(const LogTask &task) {
+void Logger::io_uring_prep_submit_task(const LogTask &task)
+{
   // 以fixed file、fixed buffer的方式提交sqe
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
   // 考虑小概率情况：SQ全满了，没有位置，则阻塞等待
-  if (sqe == NULL) {
+  if (sqe == NULL)
+  {
     // 等待cqe
     struct io_uring_cqe *cqe;
     std::cout << "SQ ring is full, blocked waiting" << std::endl;
@@ -64,10 +68,12 @@ void Logger::io_uring_prep_submit_task(const LogTask &task) {
 }
 
 // 遍历cqe，回收buffer
-void Logger::for_each_cqe_retrieve_buffer() {
+void Logger::for_each_cqe_retrieve_buffer()
+{
   struct io_uring_cqe *cqe;
   unsigned head, count = 0;
-  io_uring_for_each_cqe(&ring_, head, cqe) {
+  io_uring_for_each_cqe(&ring_, head, cqe)
+  {
     count++;
     // 接收透传数据
     BufferInfo *buffer_info;
@@ -90,12 +96,15 @@ void Logger::for_each_cqe_retrieve_buffer() {
 // 2、新建fixed buffer（多数情况）
 // 3、新建无法注册的buffer（少数情况）
 // 4、阻塞等待cqe回收buffer（极少数情况）
-Logger::BufferInfo *Logger::get_buffer() {
+Logger::BufferInfo *Logger::get_buffer()
+{
   // 尝试获取一块buffer
   BufferInfo *buffer_info;
-  if (!unused_buffer_.pop(buffer_info)) {
+  if (!unused_buffer_.pop(buffer_info))
+  {
     // 仍然可扩展fixed buffer池
-    if (new_buffer_index_ < max_fixed_buffer_capacity_) {
+    if (new_buffer_index_ < max_fixed_buffer_capacity_)
+    {
       // 无可用buffer，则新增一块
       char *new_buf = new char[max_log_len];
       int buffer_index = new_buffer_index_.fetch_add(1);
@@ -111,7 +120,8 @@ Logger::BufferInfo *Logger::get_buffer() {
     }
     // 少数情况：fixed
     // buffer池已经扩展至上限，不再将buffer注册到io_uring，但仍然开辟新buffer
-    else if (new_buffer_index_ < io_uring_entries_) {
+    else if (new_buffer_index_ < io_uring_entries_)
+    {
       std::cout << "registered buffer size has reached the upper limit, extend "
                    "a new unregistered buffer buffer_index= "
                 << new_buffer_index_ << std::endl;
@@ -123,17 +133,20 @@ Logger::BufferInfo *Logger::get_buffer() {
       buffer_info = new BufferInfo(new_buf, max_log_len, buffer_index);
     }
     // 级少数情况：内存数量已经等于io_uring_entries数量，继续开辟得到的提升不大
-    else {
+    else
+    {
       std::cout << "run out of both registered and unregistered buffer, "
                    "blocked waiting and retrive buffer"
                 << std::endl;
-      while (!unused_buffer_.pop(buffer_info)) {
+      while (!unused_buffer_.pop(buffer_info))
+      {
         std::unique_lock cq_lock(io_uring_cq_mutex_);
         struct io_uring_cqe *cqe;
         int ret =
             io_uring_wait_cqe_nr(&ring_, &cqe, submitted_unconsumed_task_num_);
         // 回收内存
-        if (ret == 0) for_each_cqe_retrieve_buffer();
+        if (ret == 0)
+          for_each_cqe_retrieve_buffer();
         // submitted_unconsumed_task_num_为0，且无就绪CQE
         else if (ret == -EAGAIN)
           continue;
@@ -146,7 +159,9 @@ Logger::BufferInfo *Logger::get_buffer() {
       }
       unused_buffer_num_--;
     }
-  } else {
+  }
+  else
+  {
     // 从队列中获取到了buffer
     unused_buffer_num_--;
   }
@@ -160,23 +175,29 @@ Logger::Logger(const std::string &log_dir,
     : log_dir_(log_dir),
       init_buffer_capacity_(init_fixed_buffer_num),
       max_fixed_buffer_capacity_(fixed_buffer_pool_size),
-      io_uring_entries_(io_uring_entries) {
+      io_uring_entries_(io_uring_entries)
+{
   // log_dir检查是否存在
-  if (!UtilFile::dir_exists(log_dir_)) {
+  if (!UtilFile::dir_exists(log_dir_))
+  {
     // 创建目录
     bool success = UtilFile::dir_create(log_dir_);
-    if (!success) UtilError::error_exit("create log dir failed, exit", true);
+    if (!success)
+      UtilError::error_exit("create log dir failed, exit", true);
   }
 
   // 空列表
-  if (logname_list.empty()) std::cout << "logname list is empty" << std::endl;
+  if (logname_list.empty())
+    std::cout << "logname list is empty" << std::endl;
 
   // 创建文件并打开
   log_files.reserve(logname_list.size());
-  for (int i = 0; i < logname_list.size(); i++) {
+  for (int i = 0; i < logname_list.size(); i++)
+  {
     // 空字符串
     const std::string &logname = logname_list[i];
-    if (logname.empty()) UtilError::error_exit("a logname is empty", false);
+    if (logname.empty())
+      UtilError::error_exit("a logname is empty", false);
 
     // 创建并打开只追加写的文件
     std::string filename = log_dir_ + '/' + logname + ".log";
@@ -205,7 +226,8 @@ Logger::Logger(const std::string &log_dir,
 
   // 注册register file
   std::vector<int> fd_list(log_files.size(), -1);
-  for (auto &&f : log_files) fd_list[f.second.file_index] = f.second.fd;
+  for (auto &&f : log_files)
+    fd_list[f.second.file_index] = f.second.fd;
   int ret = io_uring_register_files(&ring_, fd_list.data(), log_files.size());
   if (ret < 0)
     UtilError::error_exit("failed to register files, " + std::to_string(ret),
@@ -213,7 +235,8 @@ Logger::Logger(const std::string &log_dir,
 
   // 初始化缓存
   std::vector<iovec> buffer_array;
-  for (int i = 0; i < init_buffer_capacity_; i++) {
+  for (int i = 0; i < init_buffer_capacity_; i++)
+  {
     // 开辟内存
     char *buffer = new char[max_log_len];
     // buffer数组，后续批量注册buffer
@@ -230,7 +253,6 @@ Logger::Logger(const std::string &log_dir,
   // 注册register buffer
   FORCE_ASSERT(unused_buffer_.is_lock_free());
   FORCE_ASSERT(unsubmitted_tasks_.is_lock_free());
-  FORCE_ASSERT(io_uring_entries_ > 0);
   FORCE_ASSERT(init_buffer_capacity_ > 0);
   FORCE_ASSERT(max_fixed_buffer_capacity_ > 0);
   FORCE_ASSERT(io_uring_entries_ >= 32 &&
@@ -260,15 +282,18 @@ Logger::Logger(const std::string &log_dir,
   new_buffer_index_.fetch_add(init_buffer_capacity_);
 }
 
-Logger::~Logger() {
+Logger::~Logger()
+{
   // 处理未提交任务
   bool submit_task = false;
 
   LogTask task;
-  while (unsubmitted_tasks_.pop(task)) {
+  while (unsubmitted_tasks_.pop(task))
+  {
     // 保证sqe不满
     FORCE_ASSERT(submitted_unconsumed_task_num_ <= io_uring_entries_);
-    if (submitted_unconsumed_task_num_ == io_uring_entries_) {
+    if (submitted_unconsumed_task_num_ == io_uring_entries_)
+    {
       struct io_uring_cqe *cqe;
       int ret =
           io_uring_wait_cqe_nr(&ring_, &cqe, submitted_unconsumed_task_num_);
@@ -286,7 +311,8 @@ Logger::~Logger() {
     submitted_unconsumed_task_num_++;
     submit_task = true;
   }
-  if (submit_task) io_uring_submit(&ring_);
+  if (submit_task)
+    io_uring_submit(&ring_);
 
   // 等待io_uring完成已提交的io
   struct io_uring_cqe *cqe;
@@ -299,7 +325,8 @@ Logger::~Logger() {
   // 清理cqe以及buffer_info
   unsigned head;
   unsigned count = 0;
-  io_uring_for_each_cqe(&ring_, head, cqe) {
+  io_uring_for_each_cqe(&ring_, head, cqe)
+  {
     count++;
     // cqe中的buffer在此清理
     BufferInfo *buffer_info = nullptr;
@@ -309,10 +336,10 @@ Logger::~Logger() {
   io_uring_cq_advance(&ring_, count);
 
   // 未使用的buffer在此清理
-  unused_buffer_.consume_all([](const BufferInfo *info) {
+  unused_buffer_.consume_all([](const BufferInfo *info)
+                             {
     delete (char *)info->iov.iov_base;
-    delete info;
-  });
+    delete info; });
 
   // 取消注册file
   io_uring_unregister_buffers(&ring_);
@@ -324,11 +351,13 @@ Logger::~Logger() {
   io_uring_queue_exit(&ring_);
 
   // 关闭文件
-  for (const auto &it : log_files) close(it.second.fd);
+  for (const auto &it : log_files)
+    close(it.second.fd);
 }
 
 // 写日志
-void Logger::log(const std::string &logname, const std::string &msg) {
+void Logger::log(const std::string &logname, const std::string &msg)
+{
   // 日志名不存在
   auto log_file = log_files.find(logname);
   if (log_file == log_files.end())
@@ -336,13 +365,16 @@ void Logger::log(const std::string &logname, const std::string &msg) {
 
   // 可用buffer剩余不足一半，采取措施来增加可用缓存
   if (unsubmitted_tasks_num_ + submitted_unconsumed_task_num_ >=
-      unused_buffer_num_) {
+      unused_buffer_num_)
+  {
     // 抢到sq锁的线程向io_uring提交IO写请求，抢不到锁不阻塞
     if (std::unique_lock sq_lock(io_uring_sq_mutex_, std::try_to_lock);
-        sq_lock.owns_lock()) {
+        sq_lock.owns_lock())
+    {
       // 填充sqe
       LogTask task;
-      while (unsubmitted_tasks_.pop(task)) {
+      while (unsubmitted_tasks_.pop(task))
+      {
         unsubmitted_tasks_num_--;
         io_uring_prep_submit_task(task);
         submitted_unconsumed_task_num_++;
@@ -353,7 +385,8 @@ void Logger::log(const std::string &logname, const std::string &msg) {
 
     // 抢到cq锁的线程收割cqe，恢复可用缓存，不阻塞
     if (std::unique_lock cq_lock(io_uring_cq_mutex_, std::try_to_lock);
-        cq_lock.owns_lock()) {
+        cq_lock.owns_lock())
+    {
       struct io_uring_cqe *cqe;
       // 检查是否有新cqe，抢不到锁不阻塞
       if (io_uring_peek_cqe(&ring_, &cqe) == 0)
@@ -369,7 +402,8 @@ void Logger::log(const std::string &logname, const std::string &msg) {
   // 日志消息格式化
   std::string log_msg;
   format_str(logname, msg, log_msg);
-  if (log_msg.size() > max_log_len) {
+  if (log_msg.size() > max_log_len)
+  {
     std::cout << "log size exceed max log length, it will be cut" << std::endl;
     log_msg[max_log_len - 1] = '\n';
   }
@@ -382,6 +416,6 @@ void Logger::log(const std::string &logname, const std::string &msg) {
   unsubmitted_tasks_num_++;
 
 #ifndef PRODUCTION
-  std::cout << msg << std::endl;
+  std::cout << log_msg;
 #endif
 }

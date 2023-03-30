@@ -1,7 +1,11 @@
 #ifndef __LOG_H__
 #define __LOG_H__
 
+#include <liburing.h>
+#include <string.h>
+
 #include <atomic>
+#include <boost/lockfree/queue.hpp>
 #include <ctime>
 #include <iostream>
 #include <mutex>
@@ -10,23 +14,18 @@
 #include <unordered_map>
 #include <vector>
 
-#include <boost/lockfree/queue.hpp>
-
-#include <string.h>
-
-#include <liburing.h>
-
 #include "config.hpp"
-
 #include "util.hpp"
 
 using LogName = std::string;
 using FileDescriptor = int;
 
-class Logger {
+class Logger
+{
 private:
   // 日志文件信息
-  struct FileInfo {
+  struct FileInfo
+  {
     int fd;
     int file_index; // 在register file中的下标
     FileInfo() = default;
@@ -35,27 +34,31 @@ private:
   };
 
   // buffer信息
-  struct BufferInfo {
+  struct BufferInfo
+  {
     iovec iov;
     int buf_index; // 在register buffer中的下标
 
     BufferInfo() = default;
-    BufferInfo(void *ptr, size_t len, int buf_index) : buf_index(buf_index) {
+    BufferInfo(void *ptr, size_t len, int buf_index) : buf_index(buf_index)
+    {
       iov.iov_base = ptr;
       iov.iov_len = len;
     }
   };
 
   // 单次日志的写请求
-  struct LogTask {
+  struct LogTask
+  {
     int bytes_len;
     const FileInfo *file_info;
     const BufferInfo *buffer_info;
 
     LogTask() = default;
     LogTask(int bytes_len, FileInfo *file_info, BufferInfo *buffer_info)
-        : bytes_len(bytes_len), file_info(file_info), buffer_info(buffer_info) {
-    }
+        : bytes_len(bytes_len),
+          file_info(file_info),
+          buffer_info(buffer_info) {}
   };
 
 private:
@@ -65,11 +68,12 @@ private:
 
   const int init_buffer_capacity_; // 初始缓存容量
   const int
-      max_fixed_buffer_capacity_; // buffer数量不够时会动态增长，但是不超过上限
+      max_fixed_buffer_capacity_;      // buffer数量不够时会动态增长，但是不超过上限
   std::atomic<int> unused_buffer_num_; // 可用缓存数量
   boost::lockfree::queue<BufferInfo *> unused_buffer_{
       (size_t)init_buffer_capacity_}; // 缓存池中未被使用的buffer
-  std::atomic<int> new_buffer_index_{0}; // 注册入内核的buffer_index，保证唯一性
+  std::atomic<int> new_buffer_index_{
+      0}; // 注册入内核的buffer_index，保证唯一性
 
   boost::lockfree::queue<LogTask> unsubmitted_tasks_{
       (size_t)init_buffer_capacity_};         // 未提交的日志任务
@@ -118,29 +122,36 @@ public:
 };
 
 // 创建logger函数
-#define CREATE_LOGGER_FUNCTION(name)                                           \
-  static void name(const std::string &msg) { get_logger().log(#name, msg); }   \
-                                                                               \
-  template <typename... Args> static void name(Args &&...args) {               \
-    std::stringstream msg;                                                     \
-    (msg << ... << std::forward<Args>(args));                                  \
-    get_logger().log(#name, msg.str());                                        \
+#define CREATE_LOGGER_FUNCTION(name)          \
+  static void name(const std::string &msg)    \
+  {                                           \
+    get_logger().log(#name, msg);             \
+  }                                           \
+                                              \
+  template <typename... Args>                 \
+  static void name(Args &&...args)            \
+  {                                           \
+    std::stringstream msg;                    \
+    (msg << ... << std::forward<Args>(args)); \
+    get_logger().log(#name, msg.str());       \
   }
 
 // 全局静态变量写日志
-class Log {
+class Log
+{
 private:
   // meyers singleton mode
   // 局部静态变量只会在第一次被调用时实例化第一次，以后不会再实例化
   // 从而实现单例模式且可以充当全局变量，且保证调用时是已经被初始化的状态
-  static Logger &get_logger() {
+  static Logger &get_logger()
+  {
     // 运行时期的日志
     static Logger runtime_logger(
-        config::get("log_dir"),
+        config::get_str("LOG_DIR"),
         std::vector<LogName>{"debug", "info", "warn", "error"},
-        std::stoi(config::get("init_fixed_buffer_num", "32")),
-        std::stoi(config::get("fixed_buffer_pool_size", "512")),
-        std::stoi(config::get("io_uring_entries", "512")));
+        config::force_get_int("LOGGER_INIT_FIXED_BUF_NUM"),
+        config::force_get_int("LOGGER_MAX_FIXED_BUF_NUM"),
+        config::force_get_int("LOGGER_MAX_BUF_NUM"));
     return runtime_logger;
   }
 

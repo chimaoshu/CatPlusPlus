@@ -9,17 +9,26 @@
 
 const std::string root = "/var/www/html/";
 
-bool is_valid_path(const std::string &path, const std::string &root) {
+bool is_valid_path(const std::string &path, const std::string &root)
+{
   std::error_code ec;
   std::filesystem::path fs_path = std::filesystem::canonical(path, ec);
-  if (ec) {
+  if (ec)
+  {
     std::cout << "request path invalid:" << ec.message() << std::endl;
     return false;
   }
 
   std::filesystem::path fs_root = std::filesystem::canonical(root, ec);
-  if (ec) {
+  if (ec)
+  {
     std::cout << "root path invalid:" << ec.message() << std::endl;
+    return false;
+  }
+
+  if (std::filesystem::is_directory(path))
+  {
+    std::cout << "path is directory, not file" << ec.message() << std::endl;
     return false;
   }
 
@@ -27,21 +36,25 @@ bool is_valid_path(const std::string &path, const std::string &root) {
 }
 
 int web_handler(http::request<http::string_body> &req, ResponseType &res,
-                process_func_args &args) {
+                process_func_args &args)
+{
   args.use_web_server = true;
 
   std::string path = root + std::string(req.target());
-  if (is_valid_path(path, root)) {
-    std::cout << "valid path: " << args.file_path << std::endl;
-    args.file_path = path;
+  if (!is_valid_path(path, root))
+  {
+    std::cout << "invalid path: " << args.file_path << std::endl;
+    args.file_path = "/var/www/html/404.html";
     return 0;
   }
 
-  args.file_path = "/var/www/html/404.html";
+  args.file_path = path;
   return 0;
 }
 
-int main() {
-  Service server(2, 32, "0.0.0.0", 8080, 16, 32, web_handler);
+int main()
+{
+  const int worker_num = 2;
+  Service server(worker_num, web_handler);
   server.start();
 }

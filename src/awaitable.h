@@ -2,9 +2,10 @@
 
 #include "worker.h"
 
-struct socket_recv_awaitable {
-  int sock_fd_idx;                                  // 读数据socket
-  http::request_parser<http::string_body> &parser;  // http parser
+struct socket_recv_awaitable
+{
+  int sock_fd_idx;                                 // 读数据socket
+  http::request_parser<http::string_body> &parser; // http parser
 
   ConnectionTaskHandler handler;
   Worker *net_io_worker;
@@ -21,7 +22,8 @@ socket_recv_awaitable socket_recv(
     int sock_fd_idx, http::request_parser<http::string_body> &parser);
 
 // socket_send
-struct socket_send_awaitable {
+struct socket_send_awaitable
+{
   int sock_fd_idx;
 
   // 是否需要重新调用
@@ -56,7 +58,8 @@ socket_send_awaitable socket_send(int sock_fd_idx,
                                   const std::map<const void *, int> &used_buf);
 
 // socket_close
-struct socket_close_awaitable {
+struct socket_close_awaitable
+{
   int sock_fd_idx;
   ConnectionTaskHandler handler;
   bool await_ready();
@@ -68,7 +71,8 @@ socket_close_awaitable socket_close(int sock_fd_idx);
 
 // add current coroutine to work-stealing queue
 // 将当前协程添加到ws队列（本地满了就加global），可以被其他线程偷窃
-struct add_process_task_to_wsq_awaitable {
+struct add_process_task_to_wsq_awaitable
+{
   ConnectionTaskHandler handler;
   bool await_ready();
   void await_suspend(ConnectionTaskHandler h);
@@ -78,7 +82,8 @@ add_process_task_to_wsq_awaitable add_process_task_to_wsq();
 
 // add current coroutine to net_io_worker private io task queue
 // 其他worker偷窃协程，处理完process()任务后，将协程的执行权交还给io_worker
-struct add_io_task_back_to_io_worker_awaitable {
+struct add_io_task_back_to_io_worker_awaitable
+{
   int sock_fd_idx;
   bool await_ready();
   bool await_suspend(ConnectionTaskHandler h);
@@ -88,7 +93,8 @@ add_io_task_back_to_io_worker_awaitable add_io_task_back_to_io_worker(
     int sock_fd_idx);
 
 // 读取磁盘文件
-struct file_read_awaitable {
+struct file_read_awaitable
+{
   int sock_fd_idx;
   int read_file_fd;
   // 读取文件使用的buffer：fixed buffer或者temp buffer

@@ -3,7 +3,8 @@
 // socket_recv
 bool socket_recv_awaitable::await_ready() { return false; }
 
-void socket_recv_awaitable::await_suspend(ConnectionTaskHandler h) {
+void socket_recv_awaitable::await_suspend(ConnectionTaskHandler h)
+{
   // struct成员赋值
   handler = h;
   net_io_worker = h.promise().net_io_worker;
@@ -19,7 +20,8 @@ void socket_recv_awaitable::await_suspend(ConnectionTaskHandler h) {
 // 返回是否已经完成
 // false-读取未完成，需要重新co_await调用
 // true-读取已经完成/解析出错，无需重新co_await调用
-bool socket_recv_awaitable::await_resume() {
+bool socket_recv_awaitable::await_resume()
+{
   auto &promise = handler.promise();
   struct coroutine_cqe &cqe = promise.cqe;
 
@@ -28,7 +30,8 @@ bool socket_recv_awaitable::await_resume() {
   promise.current_io = IOType::NONE;
 
   // recv success
-  if (cqe.res > 0) {
+  if (cqe.res > 0)
+  {
     int prov_buf_id = cqe.flags >> 16;
     Log::debug("prov_buf_id=", prov_buf_id, " is used to recv");
 
@@ -37,7 +40,8 @@ bool socket_recv_awaitable::await_resume() {
     parser.put(
         boost::asio::buffer(net_io_worker->get_prov_buf(prov_buf_id), cqe.res),
         err);
-    if (err) {
+    if (err)
+    {
       Log::error("parse http request error", err.message());
       return true;
     }
@@ -47,21 +51,27 @@ bool socket_recv_awaitable::await_resume() {
 
     // 数据没有读完，需要再次读取
     bool recv_finished;
-    if (cqe.flags & IORING_CQE_F_SOCK_NONEMPTY) {
+    if (cqe.flags & IORING_CQE_F_SOCK_NONEMPTY)
+    {
       recv_finished = false;
     }
     // 数据读完了
-    else {
+    else
+    {
       // 是chunked-encoding，若还未done，则需要继续读取
-      if (parser.chunked()) {
+      if (parser.chunked())
+      {
         recv_finished = parser.is_done();
       }
       // 不是chunked，无论是否is_done()，都不应该继续读取了，根据协议，非chunked形式需要一次性发送
       // 如果is_done()=false，说明是bad request
-      else {
-        if (parser.need_eof()) {
+      else
+      {
+        if (parser.need_eof())
+        {
           parser.put_eof(err);
-          if (err) {
+          if (err)
+          {
             Log::error("parser put eof error", err.message());
           }
         }
@@ -71,16 +81,19 @@ bool socket_recv_awaitable::await_resume() {
     return recv_finished;
   }
   // EOF，说明客户端已经关闭
-  else if (cqe.res == 0) {
+  else if (cqe.res == 0)
+  {
     // 没有收到任何其他消息，直接受到eof，说明关闭连接了，不再处理
-    if (!parser.got_some()) {
+    if (!parser.got_some())
+    {
       return true;
     }
 
     // parser有数据，则设置eof
     error_code err;
     parser.put_eof(err);
-    if (err) {
+    if (err)
+    {
       Log::error("put eof error", err.message());
     }
 
@@ -88,7 +101,8 @@ bool socket_recv_awaitable::await_resume() {
     return true;
   }
   // recv失败，原因是prov_buf不够用
-  else if (cqe.res == -ENOBUFS) {
+  else if (cqe.res == -ENOBUFS)
+  {
     Log::debug("recv failed for lack of provide buffer");
     // 扩展内存(如果未到上限)
     net_io_worker->try_extend_prov_buf();
@@ -97,7 +111,8 @@ bool socket_recv_awaitable::await_resume() {
     return false;
   }
   // 其他失败
-  else {
+  else
+  {
     Log::error("error recv socket_fd_idx=", sock_fd_idx, " ret=", cqe.res);
     return false;
 #ifndef PRODUCTION
@@ -111,7 +126,8 @@ bool socket_recv_awaitable::await_resume() {
 // socket_send
 bool socket_send_awaitable::await_ready() { return false; }
 
-void socket_send_awaitable::await_suspend(ConnectionTaskHandler h) {
+void socket_send_awaitable::await_suspend(ConnectionTaskHandler h)
+{
   handler = h;
   net_io_worker = h.promise().net_io_worker;
   net_io_worker->send_to_client(sock_fd_idx, serialized_buffers,
@@ -123,7 +139,8 @@ void socket_send_awaitable::await_suspend(ConnectionTaskHandler h) {
 // 返回是否已经完成
 // false-写入未完成，需要重新co_await调用
 // true-写入已经完成
-bool socket_send_awaitable::await_resume() {
+bool socket_send_awaitable::await_resume()
+{
   // 要么buffer不够没完成，要么占用了buffer然后完成
   assert(!finish_send || !used_buffer_id_len.empty());
 
@@ -135,18 +152,22 @@ bool socket_send_awaitable::await_resume() {
   promise.current_io = IOType::NONE;
 
   // 未成功发送，直接返回
-  if (!finish_send) {
+  if (!finish_send)
+  {
     return false;
   }
 
   // 发送成功，回收内存
-  if (cqe.res >= 0) {
-    for (auto buf_id_len : used_buffer_id_len) {
+  if (cqe.res >= 0)
+  {
+    for (auto buf_id_len : used_buffer_id_len)
+    {
       net_io_worker->retrive_write_buf(buf_id_len.first);
     }
   }
   // 其他错误直接放弃，直接disconnect
-  else if (cqe.res < 0) {
+  else if (cqe.res < 0)
+  {
     Log::debug("send failed with cqe->res=", cqe.res);
     send_error_occurs = true;
   }
@@ -156,7 +177,8 @@ bool socket_send_awaitable::await_resume() {
 // 提交close请求
 bool socket_close_awaitable::await_ready() { return false; }
 
-void socket_close_awaitable::await_suspend(ConnectionTaskHandler h) {
+void socket_close_awaitable::await_suspend(ConnectionTaskHandler h)
+{
   handler = h;
   auto &promise = h.promise();
 
@@ -169,7 +191,8 @@ void socket_close_awaitable::await_suspend(ConnectionTaskHandler h) {
   Log::debug("submit socket close IO request, sock_fd_idx=", sock_fd_idx);
 }
 
-void socket_close_awaitable::await_resume() {
+void socket_close_awaitable::await_resume()
+{
   auto &promise = handler.promise();
   struct coroutine_cqe &cqe = promise.cqe;
 
@@ -189,7 +212,8 @@ void socket_close_awaitable::await_resume() {
 // 将当前协程添加到ws队列（本地满了就加global），可以被其他线程偷窃
 bool add_process_task_to_wsq_awaitable::await_ready() { return false; }
 
-void add_process_task_to_wsq_awaitable::await_suspend(ConnectionTaskHandler h) {
+void add_process_task_to_wsq_awaitable::await_suspend(ConnectionTaskHandler h)
+{
   handler = h;
   Worker *net_io_worker = h.promise().net_io_worker;
   net_io_worker->add_process_task(h);
@@ -202,12 +226,14 @@ void add_process_task_to_wsq_awaitable::await_resume() {}
 bool add_io_task_back_to_io_worker_awaitable::await_ready() { return false; }
 
 bool add_io_task_back_to_io_worker_awaitable::await_suspend(
-    ConnectionTaskHandler h) {
+    ConnectionTaskHandler h)
+{
   Worker *net_io_worker = h.promise().net_io_worker;
   Worker *process_worker = h.promise().process_worker;
 
   // 同一个worker，不用挂起了，直接继续执行
-  if (net_io_worker->get_worker_id() == process_worker->get_worker_id()) {
+  if (net_io_worker->get_worker_id() == process_worker->get_worker_id())
+  {
     assert(net_io_worker == process_worker);
     Log::debug(
         "the net_io_worker and process_worker is the same worker, no need to "
@@ -217,7 +243,8 @@ bool add_io_task_back_to_io_worker_awaitable::await_suspend(
     return false;
   }
   // 不同worker，需要加入队列
-  else {
+  else
+  {
     net_io_worker->add_io_resume_task(sock_fd_idx);
     Log::debug(
         "add io_task back to net_io_worker=", net_io_worker->get_worker_id(),
@@ -232,7 +259,8 @@ void add_io_task_back_to_io_worker_awaitable::await_resume() {}
 bool file_read_awaitable::await_ready() { return false; }
 
 // 返回：true-完成，false-未完成
-void file_read_awaitable::await_suspend(ConnectionTaskHandler h) {
+void file_read_awaitable::await_suspend(ConnectionTaskHandler h)
+{
   net_io_worker = h.promise().net_io_worker;
   handler = h;
   h.promise().current_io = IOType::READ;
@@ -240,13 +268,15 @@ void file_read_awaitable::await_suspend(ConnectionTaskHandler h) {
   net_io_worker->read_file(sock_fd_idx, read_file_fd, used_buffer_id, buf);
 }
 
-void file_read_awaitable::await_resume() {
+void file_read_awaitable::await_resume()
+{
   // 恢复状态
   FORCE_ASSERT(handler.promise().current_io == IOType::READ);
   handler.promise().current_io = NONE;
 
   auto cqe = handler.promise().cqe;
-  if (cqe.res < 0) {
+  if (cqe.res < 0)
+  {
     UtilError::error_exit(
         "read file failed, sock_fd_idx=" + std::to_string(sock_fd_idx) +
             "cqe.res=" + std::to_string(cqe.res),
@@ -261,34 +291,40 @@ void file_read_awaitable::await_resume() {
 }
 
 socket_recv_awaitable socket_recv(
-    int sock_fd_idx, http::request_parser<http::string_body> &parser) {
+    int sock_fd_idx, http::request_parser<http::string_body> &parser)
+{
   return socket_recv_awaitable{.sock_fd_idx = sock_fd_idx, .parser = parser};
 }
 
 socket_send_awaitable socket_send(
     int sock_fd_idx, std::list<boost::asio::const_buffer> &buffers,
-    bool &send_error_occurs, const std::map<const void *, int> &read_used_buf) {
+    bool &send_error_occurs, const std::map<const void *, int> &read_used_buf)
+{
   return socket_send_awaitable{.sock_fd_idx = sock_fd_idx,
                                .send_error_occurs = send_error_occurs,
                                .serialized_buffers = buffers,
                                .read_used_buf = read_used_buf};
 }
 
-socket_close_awaitable socket_close(int sock_fd_idx) {
+socket_close_awaitable socket_close(int sock_fd_idx)
+{
   return socket_close_awaitable{.sock_fd_idx = sock_fd_idx};
 }
 
-add_process_task_to_wsq_awaitable add_process_task_to_wsq() {
+add_process_task_to_wsq_awaitable add_process_task_to_wsq()
+{
   return add_process_task_to_wsq_awaitable{};
 }
 
 add_io_task_back_to_io_worker_awaitable add_io_task_back_to_io_worker(
-    int sock_fd_idx) {
+    int sock_fd_idx)
+{
   return add_io_task_back_to_io_worker_awaitable{.sock_fd_idx = sock_fd_idx};
 }
 
 file_read_awaitable file_read(int sock_fd_idx, int read_file_fd, void **buf,
-                              int &used_buffer_id, int &bytes_num) {
+                              int &used_buffer_id, int &bytes_num)
+{
   return file_read_awaitable{.sock_fd_idx = sock_fd_idx,
                              .read_file_fd = read_file_fd,
                              .buf = buf,
