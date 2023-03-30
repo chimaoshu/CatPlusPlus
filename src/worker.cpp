@@ -1046,12 +1046,15 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor) {
       finish_send = co_await awaitable_send;
     }
 
-    // 清理process使用的内存，write_buf_id=-1就删除
+    // 清理web_server/process使用的内存，write_buf_id=-1就删除
     // write_buf_id=-1说明不是write buf pool的
     for (auto it : used_buf) {
       if (it.second == -1) {
         delete (char *)const_cast<void *>(it.first);
       }
+    }
+    for (void *buf : args.buffer_to_delete) {
+      delete (char *)buf;
     }
 
     // 清理serializer数据

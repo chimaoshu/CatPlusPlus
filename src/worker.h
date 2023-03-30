@@ -86,8 +86,7 @@ using ResponseType = std::variant<http::response<http::string_body>,
                                   http::response<http::buffer_body>>;
 
 using SerializerType =
-    std::variant<std::monostate,
-    http::response_serializer<http::string_body>,
+    std::variant<std::monostate, http::response_serializer<http::string_body>,
                  http::response_serializer<http::buffer_body>>;
 
 // process函数的参数
@@ -95,6 +94,8 @@ struct process_func_args {
   // 以web server方式处理，以及响应的文件路径
   bool use_web_server = false;
   std::string file_path;
+  // 若使用buffer_body，可将buffer注册到此处，send完成后释放
+  std::list<void *> buffer_to_delete;
 };
 
 using ProcessFuncType =
