@@ -200,14 +200,10 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     for (auto it : used_buf)
     {
       if (it.second == -1)
-      {
         delete (char *)const_cast<void *>(it.first);
-      }
     }
     for (void *buf : args.buffer_to_delete)
-    {
       delete (char *)buf;
-    }
 
     // 清理serializer数据
     std::visit(

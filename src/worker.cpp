@@ -609,10 +609,9 @@ void Worker::run()
     // wait for 100ms
     __kernel_timespec timeout{.tv_sec = 0, .tv_nsec = 100000000};
     io_uring_wait_cqe_timeout(&ring, &cqe, &timeout);
+
     if (!cqe)
-    {
       continue;
-    }
 
     io_uring_for_each_cqe(&ring, head, cqe)
     {
@@ -766,6 +765,7 @@ void Service::start()
   while (true)
   {
     if (input == "shutdown")
+      // TODO: 优雅退出
       break;
   }
 }

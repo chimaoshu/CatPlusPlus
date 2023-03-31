@@ -1,2 +1,2 @@
 # CatPlusPlus
-A high-performance c++ web framework.
+CatPlusPlus is a high-performance c++ web framework using io_uring.
