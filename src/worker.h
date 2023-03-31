@@ -70,6 +70,9 @@ public:
     // 当前正在进行的IO
     IOType current_io = IOType::NONE;
 
+    // 进行RECV操作时，记录多个SQE的完成与否，全部完成后才可以恢复协程
+    std::map<int, bool> recv_sqe_complete;
+
   public:
     // 协程在开始执行之前会调用该方法，返回协程句柄
     auto get_return_object()
@@ -119,8 +122,8 @@ using ProcessFuncType =
 struct IORequestInfo
 {
   int fd;
-  // 对于使用io_link串联的写请求来说，中间的cqe不需要恢复协程，只有最后一个cqe出现时才恢复协程
-  bool need_resume;
+  // 对于使用io_link串联的写请求来说，需要记录串联请求的编号
+  int16_t recv_id;
   // IO类型
   IOType type;
 };

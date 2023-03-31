@@ -150,20 +150,18 @@ bool socket_send_awaitable::await_resume()
   // 确认状态正确，并还原
   FORCE_ASSERT(promise.current_io == IOType::SEND);
   promise.current_io = IOType::NONE;
+  promise.recv_sqe_complete.clear();
+  Log::debug("resume, clear recv_sqe_complete, sock_fd_idx=", sock_fd_idx);
 
   // 未成功发送，直接返回
   if (!finish_send)
-  {
     return false;
-  }
 
   // 发送成功，回收内存
   if (cqe.res >= 0)
   {
     for (auto buf_id_len : used_buffer_id_len)
-    {
       net_io_worker->retrive_write_buf(buf_id_len.first);
-    }
   }
   // 其他错误直接放弃，直接disconnect
   else if (cqe.res < 0)

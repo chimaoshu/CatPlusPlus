@@ -416,6 +416,7 @@ void Logger::log(const std::string &logname, const std::string &msg)
   unsubmitted_tasks_num_++;
 
 #ifndef PRODUCTION
-  std::cout << log_msg;
+  // debug mode
+  std::cout << log_msg << std::flush;
 #endif
 }

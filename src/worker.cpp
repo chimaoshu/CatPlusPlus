@@ -18,7 +18,7 @@ void Worker::add_multishot_accept(int listen_fd)
                                         &client_len, 0);
 
   // 设置user_data
-  IORequestInfo req_info{.fd = listen_fd, .need_resume = true, .type = ACCEPT};
+  IORequestInfo req_info{.fd = listen_fd, .recv_id = 0, .type = ACCEPT};
   memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
 
   // 提交
@@ -40,7 +40,7 @@ void Worker::add_recv(int sock_fd_idx, ConnectionTaskHandler handler,
   sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
 
   // 设置user_data
-  IORequestInfo req_info{.fd = sock_fd_idx, .need_resume = true, .type = RECV};
+  IORequestInfo req_info{.fd = sock_fd_idx, .recv_id = 0, .type = RECV};
   memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
 
   // 提交
@@ -53,6 +53,10 @@ void Worker::add_zero_copy_send(
     const std::list<std::pair<int, int>> &used_buffer_id_len)
 {
   // 循环准备SQE，使用IOSQE_IO_LINK串联起来
+  int recv_id = 0;
+  handler.promise().recv_sqe_complete.clear();
+  Log::debug("clear recv_sqe_complete, prepare to insert, sock_fd_idx=", sock_fd_idx);
+  FORCE_ASSERT(used_buffer_id_len.size() > 0);
   for (auto buf_id_len : used_buffer_id_len)
   {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
@@ -65,16 +69,22 @@ void Worker::add_zero_copy_send(
     sqe->flags |= IOSQE_FIXED_FILE;
 
     // 长度大于1则需要链接，以保证先后顺序，最后一个不设置，表示链接结束
+    // 设置也无所谓，因为IO_SQE_LINK的影响不会跨越submit
     if (used_buffer_id_len.size() > 1 &&
         buf_id_len.first != used_buffer_id_len.back().first)
       sqe->flags |= IOSQE_IO_LINK;
 
-    // 请求信息——最后一个sqe的user_data需要need_resume_coroutine=true
+    // 后续用于判断是否各SQE都完成了，才能恢复协程
+    handler.promise().recv_sqe_complete[recv_id] = false;
+    Log::debug("add recv_sqe_complete recv_id, sock_fd_idx=", sock_fd_idx, "|recv_id=", recv_id);
+
+    // user data
     IORequestInfo req_info{
         .fd = sock_fd_idx,
-        .need_resume = (buf_id_len.first == used_buffer_id_len.back().first),
+        .recv_id = static_cast<int16_t>(recv_id),
         .type = SEND};
     memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
+    recv_id++;
   }
 
   // 提交
@@ -90,7 +100,7 @@ void Worker::disconnect(int sock_fd_idx, ConnectionTaskHandler handler)
   FORCE_ASSERT(sqe != NULL);
 
   io_uring_prep_close_direct(sqe, sock_fd_idx);
-  IORequestInfo req_info{.fd = sock_fd_idx, .need_resume = true, .type = CLOSE};
+  IORequestInfo req_info{.fd = sock_fd_idx, .recv_id = 0, .type = CLOSE};
   memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
 }
 
@@ -282,6 +292,7 @@ void Worker::send_to_client(
   {
     // 将本协程放入private_queue（涉及io_uring的提交均由private queue完成）
     // 等待后续resume()后，由协程再次co_await该对象
+    Log::debug("buffer not enough, add back to io_resume_task_queue, sock_fd_idx=", sock_fd_idx);
     add_io_resume_task(sock_fd_idx);
     finish_send = false;
     return;
@@ -517,7 +528,7 @@ void Worker::add_read(int sock_fd_idx, int read_file_fd, int file_size,
   }
 
   // user data
-  IORequestInfo req_info{.fd = sock_fd_idx, .need_resume = true, .type = READ};
+  IORequestInfo req_info{.fd = sock_fd_idx, .recv_id = 0, .type = READ};
   memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
 
   // 提交
@@ -613,8 +624,8 @@ void Worker::run()
     // 没任务，阻塞wait_cqe
     struct io_uring_cqe *cqe;
     int head, count = 0;
-    // wait for 100ms
-    __kernel_timespec timeout{.tv_sec = 0, .tv_nsec = 100000000};
+    // wait for 50ms
+    __kernel_timespec timeout{.tv_sec = 0, .tv_nsec = 50000000};
     io_uring_wait_cqe_timeout(&ring, &cqe, &timeout);
 
     if (!cqe)
@@ -637,21 +648,21 @@ void Worker::run()
         auto it = connections_.find(info.fd);
         if (it == connections_.end())
         {
-          Log::error("receive a cqe of closeing fd, |cqe.res|type|", cqe->res, "|", info.type);
+          Log::error("receive a cqe of closed fd, |cqe.res|type|", cqe->res, "|", (int)info.type);
           continue;
         }
         IOType current_io =
             it->second.handler.promise().current_io;
-#ifdef PRODUCTION
+
+        // 正常请求不会出这个错误，客户端不按流程直接关闭连接会出这个错误:
+        // 例如connection reset，然后这边close之后，再收到之前还没发完的send请求
         if (current_io != io_type)
         {
           Log::error("current io not equals to cqe io_type, |cuurent_io|cqe_io|", current_io, "|", io_type, "|");
           it->second.handler.destroy();
           connections_.erase(info.fd);
+          continue;
         }
-#else
-        FORCE_ASSERT(current_io != io_type);
-#endif
       }
 
       // 根据不同IO类型进行处理
@@ -664,8 +675,9 @@ void Worker::run()
       }
       case IOType::RECV:
       {
-        copy_cqe(connections_.at(info.fd).handler.promise().cqe, *cqe);
-        add_io_resume_task(info.fd);
+        ConnectionTaskHandler handler = connections_.at(info.fd).handler;
+        copy_cqe(handler.promise().cqe, *cqe);
+        handler.resume();
         break;
       }
       case IOType::SEND:
@@ -677,8 +689,8 @@ void Worker::run()
         {
           resume = true;
         }
-        // 没出错，并且是最后一个请求
-        else if (info.need_resume)
+        // 没出错
+        else
         {
           // 接收到sendzc的第一个cqe，IORING_CQE_F_MORE表示还会有一个cqe通知表示结束
           // 此时还不能恢复，需要等待收到下一个cqe通知才可以resume
@@ -686,57 +698,59 @@ void Worker::run()
           {
             resume = false;
             Log::debug(
-                "last recv cqe, IORING_CQE_F_MORE is set, do not resume, "
+                "recv cqe, IORING_CQE_F_MORE is set, do not resume, "
                 "wait for notification cqe, sock_fd_idx=",
-                info.fd);
+                info.fd, "|recv_id=", info.recv_id);
           }
           // 通知请求
-          else if (cqe->flags & IORING_CQE_F_NOTIF)
-          {
-            resume = true;
-            Log::debug("get notification cqe of zero copy send, sock_fd_idx=",
-                       info.fd);
-          }
-          // 没有通知的cqe
+          // else if (cqe->flags & IORING_CQE_F_NOTIF)
           else
           {
-            Log::debug("cqe without notification, sock_fd_idx=", info.fd,
-                       " cqe->res=", cqe->res);
+            Log::debug("get notification cqe of zero copy send, sock_fd_idx=",
+                       info.fd, "|recv_id=", info.recv_id);
+            // 设置recv_id的complete=true
+            auto &recv_sqe_complete = connections_.at(info.fd).handler.promise().recv_sqe_complete;
+            recv_sqe_complete.at(info.recv_id) = true;
+
             resume = true;
+            // 检查是否全部SQE对应的CQE都结束了
+            for (auto it : recv_sqe_complete)
+            {
+              if (!it.second)
+              {
+                resume = false;
+                break;
+              }
+            }
           }
-        }
-        // 没出错，但不是最后一个请求
-        else
-        {
-          resume = false;
-          Log::debug("not last send cqe, ignore it, sock_fd_idx=", info.fd);
         }
 
         // 需要resume
         if (resume)
         {
-          copy_cqe(connections_.at(info.fd).handler.promise().cqe, *cqe);
+          ConnectionTaskHandler handler = connections_.at(info.fd).handler;
+          copy_cqe(handler.promise().cqe, *cqe);
           Log::debug("process send cqe, need to resume, cqe->res=", cqe->res);
-          add_io_resume_task(info.fd);
+          handler.resume();
         }
         else
         {
-          Log::debug("process send cqe and not need to resume");
+          Log::debug("process send cqe and not need to resume, sock_fd_idx=", info.fd, "|recv_id=", info.recv_id);
         }
         break;
       }
       case IOType::CLOSE:
       {
-        copy_cqe(connections_.at(info.fd).handler.promise().cqe, *cqe);
-        // 此时需要立刻resume处理，不能入队列，保证先处理close，后处理accept
-        // 否则会出现bug：还没处理sock_fd_idx的close，就先处理sock_fd_idx的下一次accept
-        connections_.at(info.fd).handler.resume();
+        ConnectionTaskHandler handler = connections_.at(info.fd).handler;
+        copy_cqe(handler.promise().cqe, *cqe);
+        handler.resume();
         break;
       }
       case IOType::READ:
       {
-        copy_cqe(connections_.at(info.fd).handler.promise().cqe, *cqe);
-        add_io_resume_task(info.fd);
+        ConnectionTaskHandler handler = connections_.at(info.fd).handler;
+        copy_cqe(handler.promise().cqe, *cqe);
+        handler.resume();
         break;
       }
       // TODO: 优雅退出
