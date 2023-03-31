@@ -627,8 +627,14 @@ void Worker::run()
       IOType io_type = info.type;
       if (io_type != ACCEPT)
       {
+        auto it = connections_.find(info.fd);
+        if (it == connections_.end())
+        {
+          Log::error("receive a cqe of closeing fd, |cqe.res|type|", cqe->res, "|", info.type);
+          continue;
+        }
         IOType current_io =
-            connections_.at(info.fd).handler.promise().current_io;
+            it->second.handler.promise().current_io;
         FORCE_ASSERT(current_io == io_type);
       }
 
