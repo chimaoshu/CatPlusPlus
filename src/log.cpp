@@ -260,7 +260,7 @@ Logger::Logger(const std::string &log_dir,
   FORCE_ASSERT(max_fixed_buffer_capacity_ >= init_buffer_capacity_);
   FORCE_ASSERT(io_uring_entries_ >= max_fixed_buffer_capacity_);
   // 这里提前设置足够大的max_buffer_capacity_，初始化时用init_buffer_capacity_，方便后续扩展内存池
-  FORCE_ASSERT(max_fixed_buffer_capacity_ < UIO_MAXIOV);
+  FORCE_ASSERT(max_fixed_buffer_capacity_ <= UIO_MAXIOV);
   // ret = io_uring_register_buffers(&ring_, buffer_array.data(),
   // buffer_array.size());
   ret = io_uring_register_buffers_sparse(

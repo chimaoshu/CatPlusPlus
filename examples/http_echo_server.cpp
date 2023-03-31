@@ -18,7 +18,6 @@ int echo_handler(http::request<http::string_body> &req,
 
 int main()
 {
-  const int worker_num = 2;
-  Service server(worker_num, echo_handler);
+  Service server(echo_handler);
   server.start();
 }

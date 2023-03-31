@@ -65,7 +65,7 @@ namespace UtilError
     if (print_perror)
       perror(msg.c_str());
     else
-      std::cout << msg << std::endl;
+      std::cerr << msg << std::endl;
 #ifdef PRODUCTION
     exit(EXIT_FAILURE);
 #else
@@ -73,11 +73,16 @@ namespace UtilError
 #endif
   }
 
-#define FORCE_ASSERT(expr) \
-  if (!(expr))             \
-  {                        \
-    std::terminate();      \
+#define FORCE_ASSERT(expr)              \
+  if (!(expr))                          \
+  {                                     \
+    std::cerr << "Assertion failed: "   \
+              << #expr << ", file "     \
+              << __FILE__ << ", line "  \
+              << __LINE__ << std::endl; \
+    std::terminate();                   \
   }
+
 } // namespace UtilError
 
 namespace UtilSystem

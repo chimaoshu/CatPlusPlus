@@ -54,7 +54,6 @@ int web_handler(http::request<http::string_body> &req, ResponseType &res,
 
 int main()
 {
-  const int worker_num = 2;
-  Service server(worker_num, web_handler);
+  Service server(web_handler);
   server.start();
 }

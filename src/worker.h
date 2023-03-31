@@ -139,7 +139,7 @@ private:
   friend Worker;
 
 public:
-  Service(int worker_num, ProcessFuncType http_handler);
+  Service(ProcessFuncType http_handler);
   ~Service();
 
   void start();

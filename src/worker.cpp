@@ -315,7 +315,14 @@ bool Worker::try_get_io_task_queue(ConnectionTaskHandler &h)
   int sock_fd_idx = private_io_task_queue.front();
   private_io_task_queue.pop();
   // h = connections_[sock_fd_idx].handler;
-  h = connections_.at(sock_fd_idx).handler;
+  auto it = connections_.find(sock_fd_idx);
+  if (it == connections_.end())
+#ifdef PRODUCTION
+    Log::error("get a cqe task with erased fd from io_task_queue");
+#else
+    std::terminate();
+#endif
+  h = it->second.handler;
   return true;
 }
 
@@ -635,7 +642,16 @@ void Worker::run()
         }
         IOType current_io =
             it->second.handler.promise().current_io;
-        FORCE_ASSERT(current_io == io_type);
+#ifdef PRODUCTION
+        if (current_io != io_type)
+        {
+          Log::error("current io not equals to cqe io_type, |cuurent_io|cqe_io|", current_io, "|", io_type, "|");
+          it->second.handler.destroy();
+          connections_.erase(info.fd);
+        }
+#else
+        FORCE_ASSERT(current_io != io_type);
+#endif
       }
 
       // 根据不同IO类型进行处理
@@ -735,8 +751,8 @@ void Worker::run()
   }
 }
 
-Service::Service(int worker_num, ProcessFuncType http_handler)
-    : worker_num(worker_num), global_queue(100)
+Service::Service(ProcessFuncType http_handler)
+    : worker_num(config::force_get_int("WORKER_NUM")), global_queue(100)
 {
   // 初始化worker
   FORCE_ASSERT(worker_num > 0);

@@ -136,6 +136,19 @@ public:
     get_logger().log(#name, msg.str());       \
   }
 
+// 创建空logger
+#define CREATE_EMPTY_LOGGER_FUNCTION(name) \
+  static void name(const std::string &msg) \
+  {                                        \
+    return;                                \
+  }                                        \
+                                           \
+  template <typename... Args>              \
+  static void name(Args &&...args)         \
+  {                                        \
+    return;                                \
+  }
+
 // 全局静态变量写日志
 class Log
 {
@@ -156,7 +169,11 @@ private:
   }
 
 public:
+#ifdef PRODUCTION
+  CREATE_EMPTY_LOGGER_FUNCTION(debug)
+#else
   CREATE_LOGGER_FUNCTION(debug)
+#endif
   CREATE_LOGGER_FUNCTION(info)
   CREATE_LOGGER_FUNCTION(warn)
   CREATE_LOGGER_FUNCTION(error)
