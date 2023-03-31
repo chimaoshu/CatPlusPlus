@@ -5,17 +5,12 @@ See [examples](https://github.com/chimaoshu/CatPlusPlus/tree/main/examples) for 
 
 for Ubuntu users:
 
-compiler(support c++ coroutine):
-apt install gcc-10
++ compiler(as long as it supports c++ coroutine): `apt install gcc-10`
 
-boost:
-apt install libboost-all-dev
++ boost: `apt install libboost-all-dev`
 
-liburing:
-https://github.com/axboe/liburing
++ liburing: https://github.com/axboe/liburing
 
-cmake >= 3.20:
-https://github.com/Kitware/CMake/releases
++ cmake >= 3.20: https://github.com/Kitware/CMake/releases
 
-system:
-Linux Kernel >= 6.1
++ Linux Kernel >= 6.1
