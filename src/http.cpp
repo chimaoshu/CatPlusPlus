@@ -156,6 +156,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
           res_buf.body().size = bytes_num;
           res_buf.body().more = false;
         }
+        close(fd);
       }
 
       // open or read fail
