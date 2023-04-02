@@ -19,19 +19,14 @@ bool is_valid_path(const std::string &path, const std::string &root)
     return false;
   }
 
-  std::filesystem::path fs_root = std::filesystem::canonical(root, ec);
-  if (ec)
-  {
-    std::cout << "root path invalid:" << ec.message() << std::endl;
-    return false;
-  }
-
-  if (std::filesystem::is_directory(path))
+  if (std::filesystem::is_directory(fs_path))
   {
     std::cout << "path is directory, not file" << ec.message() << std::endl;
     return false;
   }
 
+  // check if path is under web root directory
+  static std::filesystem::path fs_root(std::filesystem::canonical(root));
   return std::equal(fs_root.begin(), fs_root.end(), fs_path.begin());
 }
 
@@ -43,7 +38,7 @@ int web_handler(http::request<http::string_body> &req, ResponseType &res,
   std::string path = root + std::string(req.target());
   if (!is_valid_path(path, root))
   {
-    std::cout << "invalid path: " << args.file_path << std::endl;
+    std::cout << "invalid path: " << path << std::endl;
     args.file_path = "/var/www/html/404.html";
     return 0;
   }
