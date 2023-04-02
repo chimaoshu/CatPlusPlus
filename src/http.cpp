@@ -82,7 +82,8 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     // queue，后续process()操作可由其他worker处理
     // 若被其他worker处理，到了send的时候再挂起，将控制权交还给io-worker，保证IO操作均由同一个worker完成
     // 这样可以利用fixed file加速
-    co_await add_process_task_to_wsq();
+    if (config::force_get_int("ENABLE_WORK_STEALING"))
+      co_await add_process_task_to_wsq();
 
     // 构造response
     http::request<http::string_body> request;
@@ -101,11 +102,12 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     // 解析失败
     else
     {
-      Log::debug(
+      Log::error(
           "failed to process http "
           "request|is_header_done|content_length|remain_content_length|",
-          parser.is_header_done(), "|", parser.content_length(), "|",
-          parser.content_length_remaining());
+          parser.is_header_done(), "|",
+          parser.is_header_done() ? parser.content_length() : -1, "|",
+          parser.is_header_done() ? parser.content_length_remaining() : -1);
       // 构造一个bad request报文
       response = http::response<http::string_body>{};
       auto &res = std::get<http::response<http::string_body>>(response);
@@ -116,7 +118,8 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     }
 
     // 将控制权交还给io_worker
-    co_await add_io_task_back_to_io_worker(sock_fd_idx);
+    if (config::force_get_int("ENABLE_WORK_STEALING"))
+      co_await add_io_task_back_to_io_worker(sock_fd_idx);
 
     // 记录web server用于读取文件数据的buffer
     std::map<const void *, int> used_buf;
@@ -130,33 +133,44 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       // open file
       int fd = open(args.file_path.c_str(), O_RDONLY);
 
-      // open failed
-      if (fd == -1)
-      {
-        Log::debug("open file failed with file_path=", args.file_path,
-                   " reason: ", strerror(errno));
-        res_buf.version(request.version());
-        res_buf.result(http::status::not_found);
-        res_buf.body().data = NULL;
-        res_buf.body().size = 0;
-        res_buf.body().more = false;
-      }
-      // open sucess
-      else
+      // open success
+      bool read_success;
+      if (fd != -1)
       {
         // read file
         int bytes_num = -1, used_buffer_id = -1;
         void *buf = NULL;
-        co_await file_read(sock_fd_idx, fd, &buf, used_buffer_id, bytes_num);
-        used_buf[buf] = used_buffer_id;
+        read_success = co_await file_read(sock_fd_idx, fd, &buf, used_buffer_id, bytes_num);
 
-        // header
+        // success
+        if (read_success)
+        {
+          used_buf[buf] = used_buffer_id;
+
+          // header
+          res_buf.version(request.version());
+          res_buf.result(http::status::ok);
+
+          // body
+          res_buf.body().data = buf;
+          res_buf.body().size = bytes_num;
+          res_buf.body().more = false;
+        }
+      }
+
+      // open or read fail
+      if (fd == -1 || !read_success)
+      {
+        if (fd == -1)
+          Log::error("open file failed with file_path=", args.file_path,
+                     " reason: ", strerror(errno));
+        else
+          Log::error("read file failed, file_path=", args.file_path, "|sock_fd_idx=", sock_fd_idx);
+
         res_buf.version(request.version());
-        res_buf.result(http::status::ok);
-
-        // body
-        res_buf.body().data = buf;
-        res_buf.body().size = bytes_num;
+        res_buf.result(http::status::not_found);
+        res_buf.body().data = NULL;
+        res_buf.body().size = 0;
         res_buf.body().more = false;
       }
     }
@@ -180,7 +194,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
 
     if (ec)
     {
-      Log::debug(ec.message());
+      Log::error(ec.message());
       co_await socket_close(sock_fd_idx);
       co_return EPROTO;
     }

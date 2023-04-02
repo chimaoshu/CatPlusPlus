@@ -85,17 +85,13 @@ bool socket_recv_awaitable::await_resume()
   {
     // 没有收到任何其他消息，直接受到eof，说明关闭连接了，不再处理
     if (!parser.got_some())
-    {
       return true;
-    }
 
     // parser有数据，则设置eof
     error_code err;
     parser.put_eof(err);
     if (err)
-    {
       Log::error("put eof error", err.message());
-    }
 
     // 不再重试
     return true;
@@ -131,7 +127,7 @@ void socket_send_awaitable::await_suspend(ConnectionTaskHandler h)
   handler = h;
   net_io_worker = h.promise().net_io_worker;
   net_io_worker->send_to_client(sock_fd_idx, serialized_buffers,
-                                used_buffer_id_len, h, finish_send,
+                                buf_infos, h, finish_send,
                                 read_used_buf);
   h.promise().current_io = IOType::SEND;
 }
@@ -142,7 +138,7 @@ void socket_send_awaitable::await_suspend(ConnectionTaskHandler h)
 bool socket_send_awaitable::await_resume()
 {
   // 要么buffer不够没完成，要么占用了buffer然后完成
-  assert(!finish_send || !used_buffer_id_len.empty());
+  assert(!finish_send || !buf_infos.empty());
 
   auto &promise = handler.promise();
   struct coroutine_cqe &cqe = promise.cqe;
@@ -160,8 +156,11 @@ bool socket_send_awaitable::await_resume()
   // 发送成功，回收内存
   if (cqe.res >= 0)
   {
-    for (auto buf_id_len : used_buffer_id_len)
-      net_io_worker->retrive_write_buf(buf_id_len.first);
+    for (auto &buf_info : buf_infos)
+    {
+      if (buf_info.buf_id != -1)
+        net_io_worker->retrive_write_buf(buf_info.buf_id);
+    }
   }
   // 其他错误直接放弃，直接disconnect
   else if (cqe.res < 0)
@@ -201,9 +200,9 @@ void socket_close_awaitable::await_resume()
   promise.net_io_worker->connections_.erase(sock_fd_idx);
 
   if (cqe.res < 0)
-    UtilError::error_exit(
-        "close failed with cqe->res=" + std::to_string(cqe.res), false);
-  Log::debug("socket closed, sock_fd_idx=", sock_fd_idx);
+    Log::error("close failed with cqe->res=", std::to_string(cqe.res), false);
+  else
+    Log::debug("socket closed, sock_fd_idx=", sock_fd_idx);
 }
 
 // add current coroutine to work-stealing queue
@@ -256,7 +255,6 @@ void add_io_task_back_to_io_worker_awaitable::await_resume() {}
 
 bool file_read_awaitable::await_ready() { return false; }
 
-// 返回：true-完成，false-未完成
 void file_read_awaitable::await_suspend(ConnectionTaskHandler h)
 {
   net_io_worker = h.promise().net_io_worker;
@@ -266,7 +264,8 @@ void file_read_awaitable::await_suspend(ConnectionTaskHandler h)
   net_io_worker->read_file(sock_fd_idx, read_file_fd, used_buffer_id, buf);
 }
 
-void file_read_awaitable::await_resume()
+// 返回是否成功: true-读取成功 false-读取失败
+bool file_read_awaitable::await_resume()
 {
   // 恢复状态
   FORCE_ASSERT(handler.promise().current_io == IOType::READ);
@@ -275,17 +274,21 @@ void file_read_awaitable::await_resume()
   auto cqe = handler.promise().cqe;
   if (cqe.res < 0)
   {
-    UtilError::error_exit(
-        "read file failed, sock_fd_idx=" + std::to_string(sock_fd_idx) +
-            "cqe.res=" + std::to_string(cqe.res),
-        false);
+    Log::error("read failed, read_file_fd=", read_file_fd, "|used_buffer_id=", used_buffer_id, "|buffer=", *buf);
+    // retrive buffer
+    if (used_buffer_id == -1)
+      delete (char *)*buf;
+    else
+      net_io_worker->retrive_prov_buf(used_buffer_id);
+    return false;
   }
 
   bytes_num = cqe.res;
   Log::debug("read file finish, sock_fd_idx=", sock_fd_idx,
-             "|read_file_fd=", read_file_fd, "cqe.res=", cqe.res);
+             "|read_file_fd=", read_file_fd, "|cqe.res=", cqe.res);
 
   // 此时还不能删除buffer或者回收buffer，因为后续需要使用该buffer进行send操作
+  return true;
 }
 
 socket_recv_awaitable socket_recv(

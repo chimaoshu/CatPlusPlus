@@ -1,21 +1,23 @@
 #include "log.h"
 
+#include <chrono>
+#include <iomanip>
+
 // 格式化为日志格式
 void Logger::format_str(const std::string &type, const std::string &msg,
                         std::string &result)
 {
+  std::stringstream ss;
+
   // 获取时间
   time_t now = time(0);
-  char *time_cstr = ctime(&now);
-  int len = strlen(time_cstr);
-  FORCE_ASSERT(len > 1);
-  time_cstr[len - 1] = '\0';
-  std::string time_str(time_cstr);
+  std::tm now_tm;
+  localtime_r(&now, &now_tm);
 
   // 格式化
-  std::stringstream ss;
-  ss << "[" << type << "][" << time_str << "]"
-     << "[" << pthread_self() << "]" << msg;
+  ss
+      << "[" << type << "][" << std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S") << "]"
+      << "[" << pthread_self() << "]" << msg;
   if (msg.back() != '\n')
     ss << "\n";
   result = ss.str();
@@ -132,24 +134,25 @@ Logger::BufferInfo *Logger::get_buffer()
       // buffer提交
       buffer_info = new BufferInfo(new_buf, max_log_len, buffer_index);
     }
-    // 级少数情况：内存数量已经等于io_uring_entries数量，继续开辟得到的提升不大
+    // 级少数情况：内存数量已经等于io_uring_entries数量
     else
     {
-      std::cout << "run out of both registered and unregistered buffer, "
-                   "blocked waiting and retrive buffer"
-                << std::endl;
       while (!unused_buffer_.pop(buffer_info))
       {
         std::unique_lock cq_lock(io_uring_cq_mutex_);
-        struct io_uring_cqe *cqe;
-        int ret =
-            io_uring_wait_cqe_nr(&ring_, &cqe, submitted_unconsumed_task_num_);
+
+        // 不阻塞检查cqe
+        struct io_uring_cqe *cqe = NULL;
+        __kernel_timespec ts{.tv_sec = 0, .tv_nsec = 50000000};
+        int ret = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
+
+        // 没有可回收的buffer，直接返回空，准备提交积压的任务
+        if (!cqe)
+          return NULL;
+
         // 回收内存
         if (ret == 0)
           for_each_cqe_retrieve_buffer();
-        // submitted_unconsumed_task_num_为0，且无就绪CQE
-        else if (ret == -EAGAIN)
-          continue;
         // 其他错误
         else if (ret < 0)
           UtilError::error_exit("io_uring_wait_cqe_nr failed with " +
@@ -261,8 +264,7 @@ Logger::Logger(const std::string &log_dir,
   FORCE_ASSERT(io_uring_entries_ >= max_fixed_buffer_capacity_);
   // 这里提前设置足够大的max_buffer_capacity_，初始化时用init_buffer_capacity_，方便后续扩展内存池
   FORCE_ASSERT(max_fixed_buffer_capacity_ <= UIO_MAXIOV);
-  // ret = io_uring_register_buffers(&ring_, buffer_array.data(),
-  // buffer_array.size());
+  // ret = io_uring_register_buffers(&ring_, buffer_array.data(), buffer_array.size());
   ret = io_uring_register_buffers_sparse(
       &ring_, (unsigned int)max_fixed_buffer_capacity_);
   if (ret == -EINVAL)
@@ -274,6 +276,7 @@ Logger::Logger(const std::string &log_dir,
   else if (ret < 0)
     UtilError::error_exit(
         "failed to register buffers sparse, " + std::to_string(ret), false);
+
   ret = io_uring_register_buffers_update_tag(&ring_, 0, buffer_array.data(), 0,
                                              init_buffer_capacity_);
   if (ret < 0)
@@ -367,6 +370,7 @@ void Logger::log(const std::string &logname, const std::string &msg)
   if (unsubmitted_tasks_num_ + submitted_unconsumed_task_num_ >=
       unused_buffer_num_)
   {
+  tag_submit_task:
     // 抢到sq锁的线程向io_uring提交IO写请求，抢不到锁不阻塞
     if (std::unique_lock sq_lock(io_uring_sq_mutex_, std::try_to_lock);
         sq_lock.owns_lock())
@@ -397,6 +401,11 @@ void Logger::log(const std::string &logname, const std::string &msg)
 
   // 获取buffer（从多种渠道尝试）
   BufferInfo *buffer_info = get_buffer();
+  if (buffer_info == NULL)
+  {
+    std::cout << "unable to get buffer, go to submit tasks" << std::endl;
+    goto tag_submit_task;
+  }
 
   // 拷贝日志消息到buffer中
   // 日志消息格式化

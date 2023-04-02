@@ -4,6 +4,7 @@
 
 #include <boost/beast/core/make_printable.hpp>
 #include <typeinfo>
+#include <iostream>
 
 #include "awaitable.h"
 #include "http.h"
@@ -50,28 +51,36 @@ void Worker::add_recv(int sock_fd_idx, ConnectionTaskHandler handler,
 // 提交send_zc请求
 void Worker::add_zero_copy_send(
     int sock_fd_idx, ConnectionTaskHandler handler,
-    const std::list<std::pair<int, int>> &used_buffer_id_len)
+    const std::list<send_buf_info> &buf_infos)
 {
   // 循环准备SQE，使用IOSQE_IO_LINK串联起来
   int recv_id = 0;
   handler.promise().recv_sqe_complete.clear();
   Log::debug("clear recv_sqe_complete, prepare to insert, sock_fd_idx=", sock_fd_idx);
-  FORCE_ASSERT(used_buffer_id_len.size() > 0);
-  for (auto buf_id_len : used_buffer_id_len)
+  FORCE_ASSERT(buf_infos.size() > 0);
+  for (auto &buf_info : buf_infos)
   {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     FORCE_ASSERT(sqe != NULL);
+    Log::debug("add zero copy send, sock_fd_idx=", sock_fd_idx, "|write_buf_id=", buf_info.buf_id);
 
     // 填充sqe
-    io_uring_prep_send_zc_fixed(
-        sqe, sock_fd_idx, write_buffer_pool_[buf_id_len.first],
-        buf_id_len.second, MSG_WAITALL, 0, buf_id_len.first);
+    if (buf_info.buf_id != -1)
+    {
+      assert(write_buffer_pool_[buf_info.buf_id] == buf_info.buf);
+      io_uring_prep_send_zc_fixed(
+          sqe, sock_fd_idx, buf_info.buf,
+          buf_info.len, MSG_WAITALL, 0, buf_info.buf_id);
+    }
+    else
+    {
+      io_uring_prep_send_zc(sqe, sock_fd_idx, buf_info.buf, buf_info.len, MSG_WAITALL, 0);
+    }
     sqe->flags |= IOSQE_FIXED_FILE;
 
     // 长度大于1则需要链接，以保证先后顺序，最后一个不设置，表示链接结束
     // 设置也无所谓，因为IO_SQE_LINK的影响不会跨越submit
-    if (used_buffer_id_len.size() > 1 &&
-        buf_id_len.first != used_buffer_id_len.back().first)
+    if (buf_infos.size() > 1)
       sqe->flags |= IOSQE_IO_LINK;
 
     // 后续用于判断是否各SQE都完成了，才能恢复协程
@@ -89,7 +98,7 @@ void Worker::add_zero_copy_send(
 
   // 提交
   Log::debug("add send request, sock_fd_idx=", sock_fd_idx,
-             "|used_buffer_id_len.size()=", used_buffer_id_len.size());
+             "|buf_infos.size()=", buf_infos.size());
   io_uring_submit(&ring);
 }
 
@@ -168,7 +177,7 @@ void *Worker::get_prov_buf(int buf_id) { return read_buffer_pool_[buf_id]; }
 
 void Worker::send_to_client(
     int sock_fd_idx, std::list<boost::asio::const_buffer> &serialized_buffers,
-    std::list<std::pair<int, int>> &used_buffer_id_len, ConnectionTaskHandler h,
+    std::list<send_buf_info> &buf_infos, ConnectionTaskHandler h,
     bool &finish_send, const std::map<const void *, int> &read_used_buf)
 {
   // 计算所需buffer字节数与所需页数
@@ -214,18 +223,16 @@ void Worker::send_to_client(
         // 若该buffer为write_buf（只出现在body，因此不会在一开始出现）
         if (read_used_buf.find(it->data()) != read_used_buf.end())
         {
-          // 强行停止上一块write_buf（即使没有写满），保存buf和len
-          used_buffer_id_len.emplace_back(buf_id, dest_start_pos);
+          // 强行停止上一块write_buf（即使没有写满也要，但是全空则不动），保存buf和len
+          if (dest_start_pos != 0)
+            buf_infos.emplace_back(buf_id, write_buffer_pool_[buf_id], dest_start_pos);
           // 当前的write_buf直接进
-          used_buffer_id_len.emplace_back(read_used_buf.at(it->data()),
-                                          it->size());
+          buf_infos.emplace_back(read_used_buf.at(it->data()), it->data(), it->size());
           // 下一块serialized buf
           it++;
           // 看是否结束，有时候如果使用chunked-encoding，就不会结束，后续还要继续发东西
           if (it == serialized_buffers.end())
-          {
             break;
-          }
           // 更新src信息
           src_start_pos = 0;
 
@@ -242,8 +249,17 @@ void Worker::send_to_client(
         // 若已全部拷贝则退出循环
         if (it == serialized_buffers.end())
         {
-          // 写入最后一块write_buf，保存buf和len
-          used_buffer_id_len.emplace_back(buf_id, dest_start_pos);
+          // 最后一块write_buffer，如果没用过则回收回去
+          if (dest_start_pos == 0)
+          {
+            Log::debug("dest_start_pos=0, retrive write buf_id=", buf_id);
+            retrive_write_buf(buf_id);
+          }
+          // 用过，则写入最后一块write_buf，保存buf和len
+          else
+          {
+            buf_infos.emplace_back(buf_id, write_buffer_pool_[buf_id], dest_start_pos);
+          }
           break;
         }
         // 更新remain bytes
@@ -259,9 +275,7 @@ void Worker::send_to_client(
       {
         // 写完完整的一页buffer，保存buf和len
         if (dest_buf_remain_bytes == 0)
-        {
-          used_buffer_id_len.emplace_back(buf_id, page_size);
-        }
+          buf_infos.emplace_back(buf_id, write_buffer_pool_[buf_id], page_size);
         buf_id = unused_write_buffer_id_.front();
         unused_write_buffer_id_.pop();
         dest_buf_remain_bytes = page_size;
@@ -279,10 +293,10 @@ void Worker::send_to_client(
       src_start_pos += bytes_to_copy;
     }
 
-    assert(used_buffer_id_len.size() == need_page_num + read_used_buf.size());
+    assert(buf_infos.size() == need_page_num + read_used_buf.size());
 
     // 提交到io_uring，使用IOSQE_IO_LINK串联起来
-    add_zero_copy_send(sock_fd_idx, h, used_buffer_id_len);
+    add_zero_copy_send(sock_fd_idx, h, buf_infos);
     finish_send = true;
     return;
   }
@@ -314,25 +328,23 @@ void Worker::add_process_task(ConnectionTaskHandler h)
 
 void Worker::add_io_resume_task(int sock_fd_idx)
 {
-  private_io_task_queue.push(sock_fd_idx);
+  FORCE_ASSERT(private_io_task_queue.push(sock_fd_idx));
 }
 
 bool Worker::try_get_io_task_queue(ConnectionTaskHandler &h)
 {
   // 空返回false
-  if (private_io_task_queue.empty())
+  int sock_fd_idx;
+  if (!private_io_task_queue.pop(sock_fd_idx))
     return false;
+
   // 非空设置协程句柄
-  int sock_fd_idx = private_io_task_queue.front();
-  private_io_task_queue.pop();
-  // h = connections_[sock_fd_idx].handler;
   auto it = connections_.find(sock_fd_idx);
   if (it == connections_.end())
-#ifdef PRODUCTION
-    Log::error("get a cqe task with erased fd from io_task_queue");
-#else
-    std::terminate();
-#endif
+  {
+    Log::error("get a cqe task with erased fd from io_task_queue, sock_fd_idx=", sock_fd_idx);
+    return false;
+  }
   h = it->second.handler;
   return true;
 }
@@ -401,6 +413,7 @@ Worker::Worker(int worker_id, ProcessFuncType processor, Service *service)
       max_buffer_num_(config::force_get_int("WORKER_MAX_BUF_NUM")),
       self_worker_id_(worker_id),
       ws_process_task_queue(config::force_get_int("WORKER_WSQ_CAPACITY")),
+      private_io_task_queue(128),
       processor_(processor),
       service_(service)
 {
@@ -492,7 +505,20 @@ Worker::Worker(int worker_id, ProcessFuncType processor, Service *service)
       // write buf注册为register buf
       write_buffer_pool_.push_back(new_write_buf);
       iovec iov{.iov_base = new_write_buf, .iov_len = (size_t)page_size};
-      io_uring_register_buffers_update_tag(&ring, buf_id, &iov, 0, 1);
+      int ret = io_uring_register_buffers_update_tag(&ring, buf_id, &iov, 0, 1);
+      // 资源不足
+      if (ret == -ENOMEM)
+      {
+        UtilError::error_exit("ENOMEM: insufficient kernel resouces, reigster"
+                              " buffer failed. Try using ulimit -l to set a larger memlcok",
+                              false);
+      }
+      else if (ret < 0)
+      {
+        Log::error("initialize write buffer error: register failed with ret=",
+                   ret, "|buf_id=", buf_id, "|worker_id=", self_worker_id_);
+        UtilError::error_exit("initialize register buffer failed with ret=" + std::to_string(ret), false);
+      }
       unused_write_buffer_id_.push(buf_id);
     }
     // 提交provide buffer
@@ -519,6 +545,7 @@ void Worker::add_read(int sock_fd_idx, int read_file_fd, int file_size,
   // 使用fixed buffer
   if (buf_idx != -1)
   {
+    assert(write_buffer_pool_[buf_idx] == *buf);
     io_uring_prep_read_fixed(sqe, read_file_fd, *buf, file_size, 0, buf_idx);
   }
   // 使用temp buffer
@@ -542,9 +569,7 @@ void Worker::read_file(int sock_fd_idx, int read_file_fd, int &used_buffer_id,
   // 获取file size
   struct stat st;
   if (fstat(read_file_fd, &st) == -1)
-  {
     UtilError::error_exit("failed to get file size, fd=", read_file_fd);
-  }
   int file_size = st.st_size;
 
   // write_buf可用，且page_num为1，使用write_buf，作为fixed_buffer可以加速
@@ -558,6 +583,7 @@ void Worker::read_file(int sock_fd_idx, int read_file_fd, int &used_buffer_id,
     used_buffer_id = unused_write_buffer_id_.front();
     unused_write_buffer_id_.pop();
     *buf = write_buffer_pool_[used_buffer_id];
+    Log::debug("add read, sock_fd_idx=", sock_fd_idx, "|buf_id=", used_buffer_id, "|buf=", *buf, "|file_size=", file_size);
     add_read(sock_fd_idx, read_file_fd, file_size, buf, used_buffer_id);
   }
   // write_buf不够，直接开辟内存
@@ -566,6 +592,7 @@ void Worker::read_file(int sock_fd_idx, int read_file_fd, int &used_buffer_id,
     used_buffer_id = -1;
     *buf = new char[file_size];
     // -1表示不使用fixed buffer，而使用temp buffer
+    Log::debug("add read, sock_fd_idx=", sock_fd_idx, "|buf_id=", used_buffer_id, "|buf=", *buf, "|file_size=", file_size);
     add_read(sock_fd_idx, read_file_fd, file_size, buf, -1);
   }
 }
@@ -766,7 +793,7 @@ void Worker::run()
 }
 
 Service::Service(ProcessFuncType http_handler)
-    : worker_num(config::force_get_int("WORKER_NUM")), global_queue(100)
+    : worker_num(config::force_get_int("WORKER_NUM")), global_queue(128)
 {
   // 初始化worker
   FORCE_ASSERT(worker_num > 0);
@@ -800,6 +827,7 @@ void Service::start()
   std::string input;
   while (true)
   {
+    std::cin >> input;
     if (input == "shutdown")
       // TODO: 优雅退出
       break;

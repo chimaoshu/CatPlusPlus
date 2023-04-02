@@ -36,7 +36,7 @@ struct socket_send_awaitable
   std::list<boost::asio::const_buffer> &serialized_buffers;
 
   // 记录被用于send的buffer id，后续需要回收
-  std::list<std::pair<int, int>> used_buffer_id_len;
+  std::list<Worker::send_buf_info> buf_infos;
 
   const std::map<const void *, int> &read_used_buf;
 
@@ -110,7 +110,8 @@ struct file_read_awaitable
 
   bool await_ready();
   void await_suspend(ConnectionTaskHandler h);
-  void await_resume();
+  // 返回是否成功: true-读取成功 false-读取失败
+  bool await_resume();
 };
 // 读取磁盘文件
 file_read_awaitable file_read(int sock_fd_idx, int read_file_fd, void **buf,

@@ -186,7 +186,7 @@ private:
 
   // 本地私有队列，只有本worker访问，串行无锁，用于read与write请求的提交
   // 只装io任务
-  std::queue<int> private_io_task_queue;
+  boost::lockfree::queue<int> private_io_task_queue;
 
   struct io_uring ring;
 
@@ -208,9 +208,16 @@ private:
   void add_recv(int sock_fd_idx, ConnectionTaskHandler handler,
                 bool poll_first);
   // 提交send_zc请求
+  struct send_buf_info
+  {
+    int buf_id;
+    const void *buf;
+    int len;
+    send_buf_info(int buf_id, const void *buf, int len) : buf_id(buf_id), buf(buf), len(len) {}
+  };
   void add_zero_copy_send(
       int sock_fd_idx, ConnectionTaskHandler handler,
-      const std::list<std::pair<int, int>> &used_buffer_id_len);
+      const std::list<send_buf_info> &buf_infos);
   // 关闭连接（提交close请求）
   void disconnect(int sock_fd_idx, ConnectionTaskHandler handler);
   // 扩展写缓存池
@@ -227,7 +234,7 @@ private:
   // 将序列化后的buffer发送给客户端
   void send_to_client(int sock_fd_idx,
                       std::list<boost::asio::const_buffer> &serialized_buffers,
-                      std::list<std::pair<int, int>> &used_buffer_id_len,
+                      std::list<send_buf_info> &buf_infos,
                       ConnectionTaskHandler h, bool &finish_send,
                       const std::map<const void *, int> &read_used_buf);
   int get_worker_id();
