@@ -131,6 +131,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       res_buf.set(http::field::content_type, "text/html");
 
       // open file
+      // TODO: use io_uring_prep_openat_direct
       int fd = open(args.file_path.c_str(), O_RDONLY);
 
       // open success

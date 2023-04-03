@@ -130,8 +130,6 @@ void socket_send_awaitable::await_suspend(ConnectionTaskHandler h)
   net_io_worker->send_to_client(sock_fd_idx, serialized_buffers,
                                 buf_infos, h, send_submitted,
                                 read_file_buf);
-  // 记录占用资源，若协程中途销毁，可对资源进行回收
-
   h.promise().current_io = IOType::SEND;
 }
 

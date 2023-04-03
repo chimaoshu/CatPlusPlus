@@ -10,4 +10,9 @@ CMakeFiles/
 CMakeScripts/
 Makefile
 cmake_install.cmake
-# compile_commands.json
+compile_commands.json
+
+# perf output
+test/perf.data*
+test/perf.svg
+test/perf.script
