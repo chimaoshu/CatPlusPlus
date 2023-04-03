@@ -27,7 +27,7 @@ struct socket_send_awaitable
   int sock_fd_idx;
 
   // 是否需要重新调用
-  bool finish_send = false;
+  bool send_submitted = false;
 
   // 发送是否失败
   bool &send_error_occurs;
@@ -38,7 +38,8 @@ struct socket_send_awaitable
   // 记录被用于send的buffer id，后续需要回收
   std::list<Worker::send_buf_info> buf_infos;
 
-  const std::map<const void *, int> &read_used_buf;
+  const std::map<const void *, int> &read_file_buf;
+  std::list<void *> &buffer_to_delete;
 
   Worker *net_io_worker = NULL;
   ConnectionTaskHandler handler;
@@ -55,7 +56,8 @@ struct socket_send_awaitable
 socket_send_awaitable socket_send(int sock_fd_idx,
                                   std::list<boost::asio::const_buffer> &buffers,
                                   bool &send_error_occur,
-                                  const std::map<const void *, int> &used_buf);
+                                  const std::map<const void *, int> &used_buf,
+                                  std::list<void *> &buffer_to_delete);
 
 // socket_close
 struct socket_close_awaitable

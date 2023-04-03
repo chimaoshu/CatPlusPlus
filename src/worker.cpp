@@ -178,7 +178,7 @@ void *Worker::get_prov_buf(int buf_id) { return read_buffer_pool_[buf_id]; }
 void Worker::send_to_client(
     int sock_fd_idx, std::list<boost::asio::const_buffer> &serialized_buffers,
     std::list<send_buf_info> &buf_infos, ConnectionTaskHandler h,
-    bool &finish_send, const std::map<const void *, int> &read_used_buf)
+    bool &send_submitted, const std::map<const void *, int> &read_file_buf)
 {
   // 计算所需buffer字节数与所需页数
   int need_page_num = 0, temp_msg_len = 0;
@@ -186,7 +186,7 @@ void Worker::send_to_client(
   {
     // 通过`co_await file_read`已经写入write_buf的缓存
     // 前面不足一块buf的以一块buf计算
-    if (read_used_buf.find(buf.data()) != read_used_buf.end())
+    if (read_file_buf.find(buf.data()) != read_file_buf.end())
     {
       need_page_num += (temp_msg_len + page_size - 1) / page_size;
       temp_msg_len = 0;
@@ -221,13 +221,13 @@ void Worker::send_to_client(
       {
         it++;
         // 若该buffer为write_buf（只出现在body，因此不会在一开始出现）
-        if (read_used_buf.find(it->data()) != read_used_buf.end())
+        if (read_file_buf.find(it->data()) != read_file_buf.end())
         {
           // 强行停止上一块write_buf（即使没有写满也要，但是全空则不动），保存buf和len
           if (dest_start_pos != 0)
             buf_infos.emplace_back(buf_id, write_buffer_pool_[buf_id], dest_start_pos);
           // 当前的write_buf直接进
-          buf_infos.emplace_back(read_used_buf.at(it->data()), it->data(), it->size());
+          buf_infos.emplace_back(read_file_buf.at(it->data()), it->data(), it->size());
           // 下一块serialized buf
           it++;
           // 看是否结束，有时候如果使用chunked-encoding，就不会结束，后续还要继续发东西
@@ -293,11 +293,11 @@ void Worker::send_to_client(
       src_start_pos += bytes_to_copy;
     }
 
-    assert(buf_infos.size() == need_page_num + read_used_buf.size());
+    assert(buf_infos.size() == need_page_num + read_file_buf.size());
 
     // 提交到io_uring，使用IOSQE_IO_LINK串联起来
     add_zero_copy_send(sock_fd_idx, h, buf_infos);
-    finish_send = true;
+    send_submitted = true;
     return;
   }
 
@@ -308,7 +308,7 @@ void Worker::send_to_client(
     // 等待后续resume()后，由协程再次co_await该对象
     Log::debug("buffer not enough, add back to io_resume_task_queue, sock_fd_idx=", sock_fd_idx);
     add_io_resume_task(sock_fd_idx);
-    finish_send = false;
+    send_submitted = false;
     return;
   }
 
@@ -686,8 +686,7 @@ void Worker::run()
         if (current_io != io_type)
         {
           Log::error("current io not equals to cqe io_type, |cuurent_io|cqe_io|", current_io, "|", io_type, "|");
-          it->second.handler.destroy();
-          connections_.erase(info.fd);
+          FORCE_ASSERT(current_io == CLOSE);
           continue;
         }
       }

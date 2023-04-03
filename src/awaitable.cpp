@@ -40,14 +40,15 @@ bool socket_recv_awaitable::await_resume()
     parser.put(
         boost::asio::buffer(net_io_worker->get_prov_buf(prov_buf_id), cqe.res),
         err);
+
+    // 由于parser内部会拷贝buffer内容，所以这里可以将占用的prov_buf进行回收
+    net_io_worker->retrive_prov_buf(prov_buf_id);
+
     if (err)
     {
       Log::error("parse http request error", err.message());
       return true;
     }
-
-    // 由于parser内部会拷贝buffer内容，所以这里可以将占用的prov_buf进行回收
-    net_io_worker->retrive_prov_buf(prov_buf_id);
 
     // 数据没有读完，需要再次读取
     bool recv_finished;
@@ -127,8 +128,10 @@ void socket_send_awaitable::await_suspend(ConnectionTaskHandler h)
   handler = h;
   net_io_worker = h.promise().net_io_worker;
   net_io_worker->send_to_client(sock_fd_idx, serialized_buffers,
-                                buf_infos, h, finish_send,
-                                read_used_buf);
+                                buf_infos, h, send_submitted,
+                                read_file_buf);
+  // 记录占用资源，若协程中途销毁，可对资源进行回收
+
   h.promise().current_io = IOType::SEND;
 }
 
@@ -138,7 +141,7 @@ void socket_send_awaitable::await_suspend(ConnectionTaskHandler h)
 bool socket_send_awaitable::await_resume()
 {
   // 要么buffer不够没完成，要么占用了buffer然后完成
-  assert(!finish_send || !buf_infos.empty());
+  assert((!send_submitted && buf_infos.empty()) || (send_submitted && !buf_infos.empty()));
 
   auto &promise = handler.promise();
   struct coroutine_cqe &cqe = promise.cqe;
@@ -149,25 +152,36 @@ bool socket_send_awaitable::await_resume()
   promise.recv_sqe_complete.clear();
   Log::debug("resume, clear recv_sqe_complete, sock_fd_idx=", sock_fd_idx);
 
-  // 未成功发送，直接返回
-  if (!finish_send)
+  // 未成功发送，需要重新调用，直接返回false
+  if (!send_submitted)
     return false;
 
   // 发送成功，回收内存
   if (cqe.res >= 0)
   {
-    for (auto &buf_info : buf_infos)
-    {
-      if (buf_info.buf_id != -1)
-        net_io_worker->retrive_write_buf(buf_info.buf_id);
-    }
+    Log::debug("send success, sock_fd_idx=", sock_fd_idx);
+    send_error_occurs = false;
   }
-  // 其他错误直接放弃，直接disconnect
+  // 其他错误直接放弃重试，直接disconnect
   else if (cqe.res < 0)
   {
     Log::debug("send failed with cqe->res=", cqe.res);
     send_error_occurs = true;
   }
+
+  // 清理用于提交write请求的内存
+  for (auto &buf_info : buf_infos)
+  {
+    if (buf_info.buf_id != -1)
+      net_io_worker->retrive_write_buf(buf_info.buf_id);
+    else
+      delete (char *)const_cast<void *>(buf_info.buf);
+  }
+
+  // 清理process使用的内存
+  for (void *buf : buffer_to_delete)
+    delete (char *)buf;
+
   return true;
 }
 
@@ -299,12 +313,14 @@ socket_recv_awaitable socket_recv(
 
 socket_send_awaitable socket_send(
     int sock_fd_idx, std::list<boost::asio::const_buffer> &buffers,
-    bool &send_error_occurs, const std::map<const void *, int> &read_used_buf)
+    bool &send_error_occurs, const std::map<const void *, int> &read_file_buf,
+    std::list<void *> &buffer_to_delete)
 {
   return socket_send_awaitable{.sock_fd_idx = sock_fd_idx,
                                .send_error_occurs = send_error_occurs,
                                .serialized_buffers = buffers,
-                               .read_used_buf = read_used_buf};
+                               .read_file_buf = read_file_buf,
+                               .buffer_to_delete = buffer_to_delete};
 }
 
 socket_close_awaitable socket_close(int sock_fd_idx)

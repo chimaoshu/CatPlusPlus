@@ -235,8 +235,8 @@ private:
   void send_to_client(int sock_fd_idx,
                       std::list<boost::asio::const_buffer> &serialized_buffers,
                       std::list<send_buf_info> &buf_infos,
-                      ConnectionTaskHandler h, bool &finish_send,
-                      const std::map<const void *, int> &read_used_buf);
+                      ConnectionTaskHandler h, bool &send_submitted,
+                      const std::map<const void *, int> &read_file_buf);
   int get_worker_id();
   // 添加process任务至work-stealing-queue
   void add_process_task(ConnectionTaskHandler h);
