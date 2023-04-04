@@ -16,3 +16,6 @@ compile_commands.json
 test/perf.data*
 test/perf.svg
 test/perf.script
+
+#benchmark
+test/*.benchmark
