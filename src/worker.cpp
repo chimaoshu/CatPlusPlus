@@ -685,7 +685,6 @@ void Worker::run()
         // 例如connection reset，然后这边close之后，再收到之前还没发完的send请求
         if (current_io != io_type)
         {
-          Log::error("current io not equals to cqe io_type, |cuurent_io|cqe_io|", current_io, "|", io_type, "|");
           FORCE_ASSERT(current_io == CLOSE);
           continue;
         }

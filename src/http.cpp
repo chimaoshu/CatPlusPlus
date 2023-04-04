@@ -3,9 +3,21 @@
 
 #include <boost/optional/optional_io.hpp>
 
-void serialize(SerializerType &sr,
-               std::list<boost::asio::const_buffer> &buffers, error_code &ec,
-               int &data_to_consume)
+void serialize(ResponseType &res, SerializerType &sr, std::list<boost::asio::const_buffer> &buffers, error_code &ec, int &data_to_consume)
+{
+  auto visit_func = [&](auto &res)
+  {
+    res.prepare_payload();
+    using BodyType = typename std::decay_t<decltype(res)>::body_type;
+    sr.emplace<http::response_serializer<BodyType>>(res);
+    internal_serialize(sr, buffers, ec, data_to_consume);
+  };
+  std::visit(visit_func, res);
+}
+
+void internal_serialize(SerializerType &sr,
+                        std::list<boost::asio::const_buffer> &buffers, error_code &ec,
+                        int &data_to_consume)
 {
   // 序列化函数
   auto visit_func = [&buffers, &ec, &data_to_consume](auto &sr)
@@ -51,6 +63,35 @@ void serialize(SerializerType &sr,
   std::visit(visit_func, sr);
 }
 
+bool is_response_keep_alive(ResponseType &res)
+{
+  auto visit_func = [](auto &res)
+  {
+    return res.keep_alive();
+  };
+  return std::visit(visit_func, res);
+}
+
+void clear_serializer_data(SerializerType &sr, int data_to_consume)
+{
+  auto visit_func = [=](auto &sr)
+  {
+    using T = std::decay_t<decltype(sr)>;
+    // std::monostate类型直接报错
+    if constexpr (std::is_same_v<T, std::monostate>)
+    {
+      FORCE_ASSERT(false);
+    }
+    // consume
+    else
+    {
+      sr.consume(data_to_consume);
+    }
+  };
+
+  std::visit(visit_func, sr);
+}
+
 ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
 {
   while (true)
@@ -82,7 +123,8 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     // queue，后续process()操作可由其他worker处理
     // 若被其他worker处理，到了send的时候再挂起，将控制权交还给io-worker，保证IO操作均由同一个worker完成
     // 这样可以利用fixed file加速
-    if (config::force_get_int("ENABLE_WORK_STEALING"))
+    static int enable_work_stealing = config::force_get_int("ENABLE_WORK_STEALING");
+    if (enable_work_stealing)
       co_await add_process_task_to_wsq();
 
     // 构造response
@@ -118,7 +160,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     }
 
     // 将控制权交还给io_worker
-    if (config::force_get_int("ENABLE_WORK_STEALING"))
+    if (enable_work_stealing)
       co_await add_io_task_back_to_io_worker(sock_fd_idx);
 
     // 记录web server用于读取文件数据的buffer
@@ -181,19 +223,8 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     std::list<boost::asio::const_buffer> buffers;
     error_code ec;
     int data_to_consume = 0;
-    // 为了减少拷贝次数，serializer需要在闭包外初始化，等后续在consume
     SerializerType serializer;
-
-    std::visit(
-        [&](auto &res)
-        {
-          res.prepare_payload();
-          using BodyType = typename std::decay_t<decltype(res)>::body_type;
-          serializer.emplace<http::response_serializer<BodyType>>(res);
-          serialize(serializer, buffers, ec, data_to_consume);
-        },
-        response);
-
+    serialize(response, serializer, buffers, ec, data_to_consume);
     if (ec)
     {
       Log::error(ec.message());
@@ -203,8 +234,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
 
     // 返回数据给客户端
     bool finish_send = false, send_error_occurs = false;
-    auto awaitable_send =
-        socket_send(sock_fd_idx, buffers, send_error_occurs, used_buf, args.buffer_to_delete);
+    auto awaitable_send = socket_send(sock_fd_idx, buffers, send_error_occurs, used_buf, args.buffer_to_delete);
     while (!finish_send)
     {
       Log::debug("co_await awaitable_send with sock_fd_idx=", sock_fd_idx);
@@ -212,29 +242,10 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     }
 
     // 清理serializer数据
-    std::visit(
-        [=](auto &sr)
-        {
-          using T = std::decay_t<decltype(sr)>;
-          // std::monostate类型直接报错
-          if constexpr (std::is_same_v<T, std::monostate>)
-          {
-            FORCE_ASSERT(false);
-          }
-          // consume
-          else
-          {
-            sr.consume(data_to_consume);
-          }
-        },
-        serializer);
+    clear_serializer_data(serializer, data_to_consume);
 
     // 断开连接
-    bool keep_alive =
-        std::visit([](auto &res)
-                   { return res.keep_alive(); },
-                   response);
-    if (send_error_occurs || !request.keep_alive() || !keep_alive)
+    if (send_error_occurs || !request.keep_alive() || !is_response_keep_alive(response))
     {
       Log::debug("close socket");
       co_await socket_close(sock_fd_idx);
