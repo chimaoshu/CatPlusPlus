@@ -30,7 +30,7 @@ bool is_valid_path(const std::string &path, const std::string &root)
   return std::equal(fs_root.begin(), fs_root.end(), fs_path.begin());
 }
 
-int web_handler(http::request<http::string_body> &req, ResponseType &res,
+int web_handler(http::request<http::string_body> &req, http::response<http::string_body> &res,
                 process_func_args &args)
 {
   args.use_web_server = true;

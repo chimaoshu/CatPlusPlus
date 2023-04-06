@@ -1,95 +1,48 @@
 #include "http.h"
 #include "awaitable.h"
 
+#include <filesystem>
+
 #include <boost/optional/optional_io.hpp>
+#include <boost/beast/core/make_printable.hpp>
 
-void serialize(ResponseType &res, SerializerType &sr, std::list<boost::asio::const_buffer> &buffers, error_code &ec, int &data_to_consume)
+void serialize(http::response_serializer<http::string_body> &sr,
+               std::list<boost::asio::const_buffer> &buffers,
+               error_code &ec, int &data_to_consume, bool header_only)
 {
-  auto visit_func = [&](auto &res)
+  // using BodyType = typename std::decay_t<decltype(res)>::body_type;
+  data_to_consume = 0;
+  bool is_finish = false;
+
+  sr.split(header_only);
+
+  do
   {
-    res.prepare_payload();
-    using BodyType = typename std::decay_t<decltype(res)>::body_type;
-    sr.emplace<http::response_serializer<BodyType>>(res);
-    internal_serialize(sr, buffers, ec, data_to_consume);
-  };
-  std::visit(visit_func, res);
-}
+    sr.next(ec, [&](error_code &ec, auto const &buffer)
+            {
+              // hack: 不consume的话，next会循环输出，遇到一样的说明结束了
+              // 通过这种方式避免一次数据拷贝，等到拷贝到write_buf发送完再consume
+              boost::asio::const_buffer buf = *buffer.begin();
+              if (buffers.front().data() == buf.data())
+              {
+                Log::debug("get same buf with next()",
+                           ", this means that the serialization is done.");
+                is_finish = true;
+                return;
+              }
 
-void internal_serialize(SerializerType &sr,
-                        std::list<boost::asio::const_buffer> &buffers, error_code &ec,
-                        int &data_to_consume)
-{
-  // 序列化函数
-  auto visit_func = [&buffers, &ec, &data_to_consume](auto &sr)
-  {
-    using T = std::decay_t<decltype(sr)>;
-    // std::monostate类型直接报错
-    if constexpr (std::is_same_v<T, std::monostate>)
-    {
-      FORCE_ASSERT(false);
-    }
-    // 其他类型：进行序列化
-    else
-    {
-      data_to_consume = 0;
-      bool is_finish = false;
-      do
-      {
-        sr.next(ec, [&](error_code &ec, auto const &buffer)
-                {
-                  // hack: 不consume的话，next会循环输出，遇到一样的说明结束了
-                  // 通过这种方式避免一次数据拷贝，等到拷贝到write_buf发送完再consume
-                  boost::asio::const_buffer buf = *buffer.begin();
-                  if (buffers.front().data() == buf.data())
-                  {
-                    Log::debug("get same buf with next()",
-                               ", this means that the serialization is done.");
-                    is_finish = true;
-                    return;
-                  }
-
-                  ec.assign(0, ec.category());
-                  for (auto it = buffer.begin(); it != buffer.end(); it++)
-                  {
-                    buffers.push_back(*it);
-                  }
-                  data_to_consume += boost::asio::buffer_size(buffer);
-                  // sr.consume(boost::asio::buffer_size(buffer));
-                });
-      } while (!ec && !sr.is_done() && !is_finish);
-    };
-  };
-
-  std::visit(visit_func, sr);
-}
-
-bool is_response_keep_alive(ResponseType &res)
-{
-  auto visit_func = [](auto &res)
-  {
-    return res.keep_alive();
-  };
-  return std::visit(visit_func, res);
-}
-
-void clear_serializer_data(SerializerType &sr, int data_to_consume)
-{
-  auto visit_func = [=](auto &sr)
-  {
-    using T = std::decay_t<decltype(sr)>;
-    // std::monostate类型直接报错
-    if constexpr (std::is_same_v<T, std::monostate>)
-    {
-      FORCE_ASSERT(false);
-    }
-    // consume
-    else
-    {
-      sr.consume(data_to_consume);
-    }
-  };
-
-  std::visit(visit_func, sr);
+              ec.assign(0, ec.category());
+              for (auto it = buffer.begin(); it != buffer.end(); it++)
+              {
+                buffers.push_back(*it);
+              }
+              data_to_consume += boost::asio::buffer_size(buffer);
+#ifndef PRODUCTION
+              std::cout << make_printable(buffer);
+#endif
+              // sr.consume(boost::asio::buffer_size(buffer));
+            });
+  } while (!ec && ((!header_only && !sr.is_done()) || (header_only && !sr.is_header_done())) && !is_finish);
 }
 
 ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
@@ -129,7 +82,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
 
     // 构造response
     http::request<http::string_body> request;
-    ResponseType response;
+    http::response<http::string_body> response;
 
     // processor参数
     struct process_func_args args;
@@ -151,80 +104,61 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
           parser.is_header_done() ? parser.content_length() : -1, "|",
           parser.is_header_done() ? parser.content_length_remaining() : -1);
       // 构造一个bad request报文
-      response = http::response<http::string_body>{};
-      auto &res = std::get<http::response<http::string_body>>(response);
-      res.result(http::status::bad_request);
-      res.set(http::field::content_type, "text/html");
-      res.keep_alive(false);
-      res.body() = "bad request: error while parsing http request";
+      response.result(http::status::bad_request);
+      response.set(http::field::content_type, "text/html");
+      response.keep_alive(false);
+      response.body() = "bad request: error while parsing http request";
     }
 
     // 将控制权交还给io_worker
     if (enable_work_stealing)
       co_await add_io_task_back_to_io_worker(sock_fd_idx);
 
-    // 记录web server用于读取文件数据的buffer
-    std::map<const void *, int> used_buf;
+    int web_server_file_fd_idx = -1, web_server_file_size = -1;
     // process函数要求当前请求以web server方式处理
     if (args.use_web_server)
     {
-      response = http::response<http::buffer_body>{};
-      auto &res_buf = std::get<http::response<http::buffer_body>>(response);
-      res_buf.set(http::field::content_type, "text/html");
+      response.set(http::field::content_type, "text/html");
 
-      // open file
-      // TODO: use io_uring_prep_openat_direct
-      int fd = open(args.file_path.c_str(), O_RDONLY);
+      // check path
+      std::filesystem::path fs_path(args.file_path);
+      FORCE_ASSERT(std::filesystem::is_regular_file(fs_path));
+
+      // get file size
+      web_server_file_size = std::filesystem::file_size(fs_path);
+
+      // 先打开文件，后续需要先序列化并发送header，然后body使用splice一边读取一边写入socket
+      co_await file_open(sock_fd_idx, args.file_path, O_RDONLY, &web_server_file_fd_idx);
 
       // open success
-      bool read_success;
-      if (fd != -1)
+      if (web_server_file_fd_idx != -1)
       {
-        // read file
-        int bytes_num = -1, used_buffer_id = -1;
-        void *buf = NULL;
-        read_success = co_await file_read(sock_fd_idx, fd, &buf, used_buffer_id, bytes_num);
-
-        // success
-        if (read_success)
-        {
-          used_buf[buf] = used_buffer_id;
-
-          // header
-          res_buf.version(request.version());
-          res_buf.result(http::status::ok);
-
-          // body
-          res_buf.body().data = buf;
-          res_buf.body().size = bytes_num;
-          res_buf.body().more = false;
-        }
-        close(fd);
+        // header
+        response.version(request.version());
+        response.result(http::status::ok);
+        response.content_length(web_server_file_size);
       }
-
       // open or read fail
-      if (fd == -1 || !read_success)
+      else if (web_server_file_fd_idx == -1)
       {
-        if (fd == -1)
-          Log::error("open file failed with file_path=", args.file_path,
-                     " reason: ", strerror(errno));
-        else
-          Log::error("read file failed, file_path=", args.file_path, "|sock_fd_idx=", sock_fd_idx);
-
-        res_buf.version(request.version());
-        res_buf.result(http::status::not_found);
-        res_buf.body().data = NULL;
-        res_buf.body().size = 0;
-        res_buf.body().more = false;
+        Log::error("read file failed, file_path=", args.file_path, "|sock_fd_idx=", sock_fd_idx);
+        response.version(request.version());
+        response.result(http::status::not_found);
+        response.body() = "404 not found";
       }
     }
 
+    // prepare_payload会根据重新设置content-length，web server模式不能使用，否则body会为0
+    bool use_splice_to_transfer_body = (web_server_file_fd_idx != -1);
+    if (!use_splice_to_transfer_body)
+      response.prepare_payload();
+
     // 序列化response
-    std::list<boost::asio::const_buffer> buffers;
     error_code ec;
     int data_to_consume = 0;
-    SerializerType serializer;
-    serialize(response, serializer, buffers, ec, data_to_consume);
+    std::list<boost::asio::const_buffer> buffers;
+    http::response_serializer<http::string_body> serializer(response);
+    serialize(serializer, buffers, ec, data_to_consume, use_splice_to_transfer_body);
     if (ec)
     {
       Log::error(ec.message());
@@ -233,8 +167,9 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     }
 
     // 返回数据给客户端
+    std::map<const void *, int> used_buf;
     bool finish_send = false, send_error_occurs = false;
-    auto awaitable_send = socket_send(sock_fd_idx, buffers, send_error_occurs, used_buf, args.buffer_to_delete);
+    auto awaitable_send = socket_send(sock_fd_idx, buffers, send_error_occurs, used_buf);
     while (!finish_send)
     {
       Log::debug("co_await awaitable_send with sock_fd_idx=", sock_fd_idx);
@@ -242,12 +177,31 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     }
 
     // 清理serializer数据
-    clear_serializer_data(serializer, data_to_consume);
+    serializer.consume(data_to_consume);
+
+    // 如果是splice模式，前面只发送了header，现在body部分需要通过splice来实现file到socket的零拷贝发送
+    if (use_splice_to_transfer_body)
+    {
+      bool is_success = false;
+      co_await file_send(sock_fd_idx, web_server_file_fd_idx, web_server_file_size, &is_success);
+
+      if (is_success)
+      {
+        Log::debug("splce send success, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", web_server_file_fd_idx);
+        send_error_occurs = false;
+      }
+      else
+      {
+        Log::error("splice send failed, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", web_server_file_fd_idx);
+        send_error_occurs = true;
+      }
+      co_await file_close(sock_fd_idx, web_server_file_fd_idx);
+    }
 
     // 断开连接
-    if (send_error_occurs || !request.keep_alive() || !is_response_keep_alive(response))
+    if (send_error_occurs || !request.keep_alive() || !response.keep_alive())
     {
-      Log::debug("close socket");
+      Log::debug("prepare to close socket");
       co_await socket_close(sock_fd_idx);
       co_return 0;
     }

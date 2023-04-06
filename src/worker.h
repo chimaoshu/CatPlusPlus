@@ -30,12 +30,15 @@ using namespace boost::beast;
 enum IOType : uint8_t
 {
   ACCEPT,
-  RECV,
-  SEND,
-  CLOSE,
+  RECV_SOCKET,
+  SEND_SOCKET,
+  CLOSE_SOCKET,
   SHUTDOWN,
   NONE,
-  READ
+  READ_FILE,
+  OPEN_FILE,
+  CLOSE_FILE,
+  SEND_FILE
 };
 
 // cqe的柔性数组在c++20协程中会出问题
@@ -60,7 +63,7 @@ public:
 
     // 负责当前io的worker，在accept后设置，为了使用fixed
     // file特性，协程的recv与send均由该worker完成
-    Worker *net_io_worker = NULL;
+    Worker *io_worker = NULL;
     // 负责process任务的worker，可能与io_worker不同
     Worker *process_worker = NULL;
 
@@ -71,7 +74,9 @@ public:
     IOType current_io = IOType::NONE;
 
     // 进行RECV操作时，记录多个SQE的完成与否，全部完成后才可以恢复协程
-    std::map<int, bool> recv_sqe_complete;
+    std::map<int, bool> send_sqe_complete;
+    // 进行SEND_FILE操作时，记录多个SQE的完成与否，全部完成后才可以恢复协程
+    std::map<int, bool> sendfile_sqe_complete;
 
   public:
     // 协程在开始执行之前会调用该方法，返回协程句柄
@@ -98,32 +103,23 @@ public:
 using ConnectionTaskHandler =
     typename std::coroutine_handle<typename ConnectionTask::promise_type>;
 
-using ResponseType = std::variant<http::response<http::string_body>,
-                                  http::response<http::buffer_body>>;
-
-using SerializerType =
-    std::variant<std::monostate, http::response_serializer<http::string_body>,
-                 http::response_serializer<http::buffer_body>>;
-
 // process函数的参数
 struct process_func_args
 {
   // 以web server方式处理，以及响应的文件路径
   bool use_web_server = false;
   std::string file_path;
-  // 若使用buffer_body，可将buffer注册到此处，send完成后释放
-  std::list<void *> buffer_to_delete;
 };
 
 using ProcessFuncType =
-    std::function<int(http::request<http::string_body> &, ResponseType &,
+    std::function<int(http::request<http::string_body> &, http::response<http::string_body> &,
                       process_func_args &args)>;
 
 struct IORequestInfo
 {
   int fd;
   // 对于使用io_link串联的写请求来说，需要记录串联请求的编号
-  int16_t recv_id;
+  int16_t req_id;
   // IO类型
   IOType type;
 };
@@ -200,6 +196,9 @@ private:
   friend struct add_process_task_to_wsq_awaitable;
   friend struct add_io_task_back_to_io_worker_awaitable;
   friend struct file_read_awaitable;
+  friend struct file_open_awaitable;
+  friend struct file_close_awaitable;
+  friend struct file_send_awaitable;
 
 private:
   // 提交multishot_accept请求
@@ -236,7 +235,7 @@ private:
                       std::list<boost::asio::const_buffer> &serialized_buffers,
                       std::list<send_buf_info> &buf_infos,
                       ConnectionTaskHandler h, bool &send_submitted,
-                      const std::map<const void *, int> &read_file_buf);
+                      const std::map<const void *, int> &used_write_buf);
   int get_worker_id();
   // 添加process任务至work-stealing-queue
   void add_process_task(ConnectionTaskHandler h);
@@ -247,11 +246,16 @@ private:
   // 处理accept请求
   void handle_accept(const struct io_uring_cqe *cqe);
   // 提交read请求
-  void add_read(int sock_fd_idx, int read_file_fd, int file_size, void **buf,
-                int buf_idx);
+  void add_read(int sock_fd_idx, int read_file_fd, int file_size, void **buf, int buf_idx);
   // 读取文件
-  void read_file(int sock_fd_idx, int read_file_fd, int &used_buffer_id,
-                 void **buf);
+  void read_file(int sock_fd_idx, int read_file_fd, int file_size, int *used_buffer_id, void **buf);
+  // 打开文件
+  void open_file_direct(int sock_fd_idx, const std::string &path, mode_t mode);
+  // 关闭文件
+  void close_direct_file(int sock_fd_idx, int file_fd_idx);
+  // sendfile
+  void sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
+                std::map<int, bool> &sendfile_sqe_complete, int *pipefd);
 
 public:
   Worker(int worker_id, ProcessFuncType processor, Service *service);
