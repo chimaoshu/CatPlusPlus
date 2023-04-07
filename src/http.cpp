@@ -78,6 +78,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     if (enable_work_stealing)
       co_await add_io_task_back_to_io_worker(sock_fd_idx);
 
+    bool open_failed;
     int web_server_file_fd = -1;
     int web_server_file_size = -1;
     static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
@@ -114,6 +115,8 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       // open success
       if (web_server_file_fd != -1)
       {
+        open_failed = false;
+
         // header
         response.version(request.version());
         response.keep_alive(request.keep_alive());
@@ -123,6 +126,8 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       // open or read fail
       else if (web_server_file_fd == -1)
       {
+        open_failed = true;
+
         Log::error("read file failed, file_path=", args.file_path, "|sock_fd_idx=", sock_fd_idx);
         response.version(request.version());
         response.keep_alive(request.keep_alive());
@@ -137,7 +142,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
                                                         (web_server_file_size > splice_threshold));
 
     // prepare_payload会根据重新设置content-length，web server模式不能使用，否则body会为0
-    if (!use_splice_to_transfer_body)
+    if (!use_splice_to_transfer_body || (use_splice_to_transfer_body && open_failed))
       response.prepare_payload();
 
     std::map<const void *, int> read_file_used_buf;
