@@ -438,7 +438,11 @@ bool file_read_awaitable::await_resume()
   if (cqe.res < 0)
   {
     Log::error("read failed, read_file_fd_idx=", read_file_fd_idx, "|used_buffer_id=", *used_buffer_id, "|buffer=", *buf);
-    io_worker->retrive_prov_buf(*used_buffer_id);
+    // retrive buffer
+    if (*used_buffer_id == -1)
+      delete (char *)*buf;
+    else
+      io_worker->retrive_prov_buf(*used_buffer_id);
     *read_success = false;
     return true;
   }

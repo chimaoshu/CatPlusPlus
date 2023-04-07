@@ -862,6 +862,7 @@ void Worker::run()
         // 例如connection reset，然后这边close之后，再收到之前还没发完的send请求
         if (current_io != io_type)
         {
+          // TODO: 完善
           FORCE_ASSERT((current_io == CLOSE_SOCKET && io_type == SEND_SOCKET) ||
                        (current_io == CLOSE_FILE && io_type == SEND_FILE));
           continue;
