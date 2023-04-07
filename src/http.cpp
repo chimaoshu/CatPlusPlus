@@ -61,41 +61,40 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
     std::map<const void *, int> web_file_used_buf;
 
+    // 完成解析
+    bool bad_request = !parser.is_done();
+    if (!bad_request)
+    {
+      request = parser.release();
+      processor(request, response, args);
+    }
+    // 解析失败
+    else
+    {
+      Log::error(
+          "failed to process http "
+          "request|is_header_done|content_length|remain_content_length|",
+          parser.is_header_done(), "|",
+          parser.is_header_done() ? parser.content_length() : -1, "|",
+          parser.is_header_done() ? parser.content_length_remaining() : -1);
+      // 构造一个bad request报文
+      response.result(http::status::bad_request);
+      response.set(http::field::content_type, "text/html");
+      response.keep_alive(false);
+      response.body() = "bad request: error while parsing http request";
+
+      // 跳到serialize-send阶段，直接发送错误响应
+      break;
+    }
+
+    // 将控制权交还给io_worker
+    if (enable_work_stealing)
+      co_await add_io_task_back_to_io_worker(sock_fd_idx);
+
     do
     {
-      // 完成解析
-      bool bad_request = !parser.is_done();
-      if (!bad_request)
-      {
-        request = parser.release();
-        processor(request, response, args);
-      }
-      // 解析失败
-      else
-      {
-        Log::error(
-            "failed to process http "
-            "request|is_header_done|content_length|remain_content_length|",
-            parser.is_header_done(), "|",
-            parser.is_header_done() ? parser.content_length() : -1, "|",
-            parser.is_header_done() ? parser.content_length_remaining() : -1);
-        // 构造一个bad request报文
-        response.result(http::status::bad_request);
-        response.set(http::field::content_type, "text/html");
-        response.keep_alive(false);
-        response.body() = "bad request: error while parsing http request";
-        response.prepare_payload();
-
-        // 跳到serialize-send阶段，直接发送错误响应
-        break;
-      }
-
-      // 将控制权交还给io_worker
-      if (enable_work_stealing)
-        co_await add_io_task_back_to_io_worker(sock_fd_idx);
-
       // process函数要求当前请求以web server方式处理
-      if (args.use_web_server)
+      if (!bad_request && args.use_web_server)
       {
         response.set(http::field::content_type, "text/html");
 
@@ -133,7 +132,6 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
           response.keep_alive(request.keep_alive());
           response.result(http::status::not_found);
           response.body() = "404 not found";
-          response.prepare_payload();
 
           // 跳到serialize-send阶段，直接发送错误响应
           break;
@@ -208,7 +206,6 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
             response.keep_alive(request.keep_alive());
             response.result(http::status::not_found);
             response.body() = "404 not found";
-            response.prepare_payload();
           }
 
           // 关闭文件 direct
@@ -235,11 +232,15 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     http::response_serializer<http::buffer_body> *serializer_buf = NULL;
     if (use_buf_body)
     {
+      if (!use_splice_to_transfer_body)
+        response_buf.prepare_payload();
       serializer_buf = new http::response_serializer<http::buffer_body>(response_buf);
       serialize(serializer_buf, buffers, ec, data_to_consume, use_splice_to_transfer_body);
     }
     else
     {
+      if (!use_splice_to_transfer_body)
+        response.prepare_payload();
       serializer = new http::response_serializer<http::string_body>(response);
       serialize(serializer, buffers, ec, data_to_consume, use_splice_to_transfer_body);
     }
