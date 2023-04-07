@@ -11,7 +11,14 @@ void socket_recv_awaitable::await_suspend(ConnectionTaskHandler h)
 
   // 提交recv请求
   Log::debug("add recv at sock_fd_idx=", sock_fd_idx);
-  io_worker->add_recv(sock_fd_idx, h, true);
+  submit_success = io_worker->add_recv(sock_fd_idx, h, true);
+  // FORCE_ASSERT(submit_success);
+
+  if (!submit_success)
+  {
+    io_worker->add_io_resume_task(sock_fd_idx);
+    Log::error("sqe not enough while adding recv, add back to queue, sock_fd_idx=", sock_fd_idx);
+  }
 
   // 设置IO状态
   h.promise().current_io = IOType::RECV_SOCKET;
@@ -23,11 +30,18 @@ void socket_recv_awaitable::await_suspend(ConnectionTaskHandler h)
 bool socket_recv_awaitable::await_resume()
 {
   auto &promise = handler.promise();
-  struct coroutine_cqe &cqe = promise.cqe;
 
   // 确认resume正确，恢复当前IO状态
   FORCE_ASSERT(promise.current_io == IOType::RECV_SOCKET);
   promise.current_io = IOType::NONE;
+
+  if (!submit_success)
+  {
+    Log::debug("socket recv resume, but submit failed on suspend, retry again, sock_fd_idx=", sock_fd_idx);
+    return false;
+  }
+
+  struct coroutine_cqe &cqe = promise.cqe;
 
   // recv success
   if (cqe.res > 0)
@@ -35,11 +49,13 @@ bool socket_recv_awaitable::await_resume()
     int prov_buf_id = cqe.flags >> 16;
     Log::debug("prov_buf_id=", prov_buf_id, " is used to recv");
 
+#ifndef PRODUCTION
+    std::cout << std::string_view((char *)io_worker->get_prov_buf(prov_buf_id), cqe.res) << std::flush;
+#endif
+
     // 把buffer丢进parser
     error_code err;
-    parser.put(
-        boost::asio::buffer(io_worker->get_prov_buf(prov_buf_id), cqe.res),
-        err);
+    parser.put(boost::asio::buffer(io_worker->get_prov_buf(prov_buf_id), cqe.res), err);
 
     // 由于parser内部会拷贝buffer内容，所以这里可以将占用的prov_buf进行回收
     io_worker->retrive_prov_buf(prov_buf_id);
@@ -138,9 +154,18 @@ void socket_send_awaitable::await_suspend(ConnectionTaskHandler h)
 {
   handler = h;
   io_worker = h.promise().io_worker;
-  io_worker->send_to_client(sock_fd_idx, serialized_buffers,
-                            buf_infos, h, send_submitted,
-                            used_write_buf);
+  submit_success = io_worker->send_to_client(sock_fd_idx, serialized_buffers,
+                                             buf_infos, h, used_write_buf);
+
+  // 将本协程放入io_queue
+  // 等待后续resume()后，由协程再次co_await该对象
+  if (!submit_success)
+  {
+    Log::error("buffer or entries not enough whiling sending socket, add back to io_resume_task_queue, sock_fd_idx=",
+               sock_fd_idx);
+    io_worker->add_io_resume_task(sock_fd_idx);
+  }
+
   h.promise().current_io = IOType::SEND_SOCKET;
 }
 
@@ -149,11 +174,10 @@ void socket_send_awaitable::await_suspend(ConnectionTaskHandler h)
 // true-写入已经完成
 bool socket_send_awaitable::await_resume()
 {
-  // 要么buffer不够没完成，要么占用了buffer然后完成
-  assert((!send_submitted && buf_infos.empty()) || (send_submitted && !buf_infos.empty()));
+  // 要么buffer或者entries不够没完成，要么占用了buffer然后完成
+  assert((!submit_success && buf_infos.empty()) || (submit_success && !buf_infos.empty()));
 
   auto &promise = handler.promise();
-  struct coroutine_cqe &cqe = promise.cqe;
 
   // 确认状态正确，并还原
   FORCE_ASSERT(promise.current_io == IOType::SEND_SOCKET);
@@ -162,8 +186,13 @@ bool socket_send_awaitable::await_resume()
   Log::debug("resume, clear send_sqe_complete, sock_fd_idx=", sock_fd_idx);
 
   // 未成功发送，需要重新调用，直接返回false
-  if (!send_submitted)
+  if (!submit_success)
+  {
+    Log::debug("socket send resume, but submit failed on suspend, retry again, sock_fd_idx=", sock_fd_idx);
     return false;
+  }
+
+  struct coroutine_cqe &cqe = promise.cqe;
 
   // 发送成功，回收内存
   if (cqe.res >= 0)
@@ -179,7 +208,6 @@ bool socket_send_awaitable::await_resume()
   }
 
   // 清理用于提交write请求的内存
-  // TODO: deprecatd
   for (auto &buf_info : buf_infos)
   {
     if (buf_info.buf_id != -1)
@@ -203,44 +231,56 @@ void socket_close_awaitable::await_suspend(ConnectionTaskHandler h)
 
   // 关闭连接
   Worker *io_worker = promise.io_worker;
-  io_worker->disconnect(sock_fd_idx, h);
+  submit_success = io_worker->disconnect(sock_fd_idx, h);
+  // FORCE_ASSERT(submit_success);
+
+  if (!submit_success)
+  {
+    io_worker->add_io_resume_task(sock_fd_idx);
+    Log::error("sqe not enough while closing socket, add back to queue, sock_fd_idx=", sock_fd_idx);
+  }
+
   Log::debug("submit socket close IO request, sock_fd_idx=", sock_fd_idx);
 }
 
-void socket_close_awaitable::await_resume()
+bool socket_close_awaitable::await_resume()
 {
   auto &promise = handler.promise();
-  struct coroutine_cqe &cqe = promise.cqe;
 
   // 检查状态
   FORCE_ASSERT(promise.current_io == IOType::CLOSE_SOCKET);
   promise.current_io = IOType::NONE;
 
+  if (!submit_success)
+  {
+    Log::debug("socket close resume, but submit failed on suspend, retry again, sock_fd_idx=", sock_fd_idx);
+    return false;
+  }
+
+  struct coroutine_cqe &cqe = promise.cqe;
   promise.io_worker->connections_.erase(sock_fd_idx);
 
   if (cqe.res < 0)
     Log::error("close failed with cqe->res=", std::to_string(cqe.res), false);
   else
     Log::debug("socket closed, sock_fd_idx=", sock_fd_idx);
+  return true;
 }
 
 // add current coroutine to work-stealing queue
 // 将当前协程添加到ws队列（本地满了就加global），可以被其他线程偷窃
 bool add_process_task_to_wsq_awaitable::await_ready() { return false; }
-
 void add_process_task_to_wsq_awaitable::await_suspend(ConnectionTaskHandler h)
 {
   handler = h;
   Worker *io_worker = h.promise().io_worker;
   io_worker->add_process_task(h);
 }
-
 void add_process_task_to_wsq_awaitable::await_resume() {}
 
 // add current coroutine to io_worker private io task queue
 // 其他worker偷窃协程，处理完process()任务后，将协程的执行权交还给io_worker
 bool add_io_task_back_to_io_worker_awaitable::await_ready() { return false; }
-
 bool add_io_task_back_to_io_worker_awaitable::await_suspend(
     ConnectionTaskHandler h)
 {
@@ -269,7 +309,6 @@ bool add_io_task_back_to_io_worker_awaitable::await_suspend(
     return true;
   }
 }
-
 void add_io_task_back_to_io_worker_awaitable::await_resume() {}
 
 bool file_open_awaitable::await_ready() { return false; }
@@ -278,7 +317,15 @@ void file_open_awaitable::await_suspend(ConnectionTaskHandler h)
   handler = h;
   io_worker = h.promise().io_worker;
 
-  io_worker->open_file_direct(sock_fd_idx, path, mode);
+  submit_success = io_worker->open_file_direct(sock_fd_idx, path, mode);
+  // FORCE_ASSERT(submit_success);
+
+  if (!submit_success)
+  {
+    io_worker->add_io_resume_task(sock_fd_idx);
+    Log::error("sqe not enough while opening socket, add back to queue, sock_fd_idx=", sock_fd_idx);
+  }
+
   h.promise().current_io = OPEN_FILE;
 }
 bool file_open_awaitable::await_resume()
@@ -286,6 +333,12 @@ bool file_open_awaitable::await_resume()
   // 恢复状态
   FORCE_ASSERT(handler.promise().current_io == IOType::OPEN_FILE);
   handler.promise().current_io = NONE;
+
+  if (!submit_success)
+  {
+    Log::debug("file open resume, but submit failed on suspend, retry again, sock_fd_idx=", sock_fd_idx);
+    return false;
+  }
 
   auto cqe = handler.promise().cqe;
   if (cqe.res < 0)
@@ -312,7 +365,15 @@ void file_close_awaitable::await_suspend(ConnectionTaskHandler h)
   handler = h;
 
   h.promise().current_io = CLOSE_FILE;
-  io_worker->close_direct_file(sock_fd_idx, file_fd_idx);
+
+  submit_success = io_worker->close_direct_file(sock_fd_idx, file_fd_idx);
+  // FORCE_ASSERT(submit_success);
+  if (!submit_success)
+  {
+    Log::error("sqe not enough while closeing file, add back to queue, sock_fd_idx=", sock_fd_idx);
+    io_worker->add_io_resume_task(sock_fd_idx);
+  }
+
   Log::debug("submit file close request, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", file_fd_idx);
 }
 bool file_close_awaitable::await_resume()
@@ -320,6 +381,12 @@ bool file_close_awaitable::await_resume()
   // 恢复状态
   FORCE_ASSERT(handler.promise().current_io == IOType::CLOSE_FILE);
   handler.promise().current_io = NONE;
+
+  if (!submit_success)
+  {
+    Log::debug("file close resume, but submit failed on suspend, retry again, sock_fd_idx=", sock_fd_idx);
+    return false;
+  }
 
   auto cqe = handler.promise().cqe;
   if (cqe.res < 0)
@@ -330,7 +397,7 @@ bool file_close_awaitable::await_resume()
   }
   else
   {
-    Log::debug("close file direct failed, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", file_fd_idx);
+    Log::debug("close file direct success, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", file_fd_idx);
     return true;
   }
   assert(false);
@@ -343,28 +410,44 @@ void file_read_awaitable::await_suspend(ConnectionTaskHandler h)
   handler = h;
   h.promise().current_io = IOType::READ_FILE;
   // 读取文件
-  io_worker->read_file(sock_fd_idx, read_file_fd, file_size, used_buffer_id, buf);
+  submit_success = io_worker->read_file(sock_fd_idx, read_file_fd_idx, file_size,
+                                        used_buffer_id, buf, fixed_file);
+  // FORCE_ASSERT(submit_success);
+
+  if (!submit_success)
+  {
+    Log::error("sqe not enough while reading file, add back to queue, sock_fd_idx=", sock_fd_idx);
+    io_worker->add_io_resume_task(sock_fd_idx);
+  }
 }
-// 返回是否成功: true-读取成功 false-读取失败
+// 返回是否重试: true-完成 false-未完成, 需要重试
 bool file_read_awaitable::await_resume()
 {
   // 恢复状态
   FORCE_ASSERT(handler.promise().current_io == IOType::READ_FILE);
   handler.promise().current_io = NONE;
 
-  auto cqe = handler.promise().cqe;
-  if (cqe.res < 0)
+  if (!submit_success)
   {
-    Log::error("read failed, read_file_fd=", read_file_fd, "|used_buffer_id=", *used_buffer_id, "|buffer=", *buf);
-    io_worker->retrive_prov_buf(*used_buffer_id);
+    Log::debug("file read resume, but submit failed on suspend, retry again, sock_fd_idx=", sock_fd_idx);
+    *read_success = false;
     return false;
   }
 
-  *bytes_num = cqe.res;
+  auto cqe = handler.promise().cqe;
+  if (cqe.res < 0)
+  {
+    Log::error("read failed, read_file_fd_idx=", read_file_fd_idx, "|used_buffer_id=", *used_buffer_id, "|buffer=", *buf);
+    io_worker->retrive_prov_buf(*used_buffer_id);
+    *read_success = false;
+    return true;
+  }
+
   Log::debug("read file finish, sock_fd_idx=", sock_fd_idx,
-             "|read_file_fd=", read_file_fd, "|cqe.res=", cqe.res);
+             "|read_file_fd_idx=", read_file_fd_idx, "|cqe.res=", cqe.res);
 
   // 此时还不能删除buffer或者回收buffer，因为后续需要使用该buffer进行send操作
+  *read_success = true;
   return true;
 }
 
@@ -374,13 +457,37 @@ void file_send_awaitable::await_suspend(ConnectionTaskHandler h)
   io_worker = h.promise().io_worker;
   handler = h;
   h.promise().current_io = IOType::SEND_FILE;
-  io_worker->sendfile(sock_fd_idx, read_file_fd_idx, file_size, h.promise().sendfile_sqe_complete, pipefd);
+
+  if (!is_pipe_init)
+  {
+    int ret = pipe(pipefd);
+    if (ret == -1)
+      UtilError::error_exit("create pipe failed, check open file limit", false);
+    is_pipe_init = true;
+  }
+
+  submit_success = io_worker->sendfile(sock_fd_idx, read_file_fd_idx, file_size,
+                                       h.promise().sendfile_sqe_complete, pipefd, fixed_file);
+  // FORCE_ASSERT(submit_success);
+
+  // entires不足，将协程放回队列
+  if (!submit_success)
+  {
+    io_worker->add_io_resume_task(sock_fd_idx);
+    Log::error("sqe not enough while sending file, add back to queue, sock_fd_idx=", sock_fd_idx);
+  }
 }
 bool file_send_awaitable::await_resume()
 {
   // 恢复状态
   FORCE_ASSERT(handler.promise().current_io == IOType::SEND_FILE);
   handler.promise().current_io = NONE;
+
+  if (!submit_success)
+  {
+    Log::debug("file send resume, but submit failed on suspend, retry again, sock_fd_idx=", sock_fd_idx);
+    return false;
+  }
 
   // close
   close(pipefd[0]);

@@ -10,6 +10,8 @@ struct socket_recv_awaitable
   ConnectionTaskHandler handler;
   Worker *io_worker;
 
+  bool submit_success = false;
+
   bool await_ready();
   void await_suspend(ConnectionTaskHandler h);
   // 返回是否已经完成
@@ -28,8 +30,8 @@ struct socket_send_awaitable
 {
   int sock_fd_idx;
 
-  // 是否需要重新调用
-  bool send_submitted = false;
+  // 是否成功提交
+  bool submit_success = false;
 
   // 发送是否失败
   bool &send_error_occurs;
@@ -71,11 +73,14 @@ inline auto socket_send(int sock_fd_idx,
 struct socket_close_awaitable
 {
   int sock_fd_idx;
+
+  bool submit_success = false;
+
   ConnectionTaskHandler handler;
   bool await_ready();
   // 提交close请求
   void await_suspend(ConnectionTaskHandler h);
-  void await_resume();
+  bool await_resume();
 };
 inline auto socket_close(int sock_fd_idx)
 {
@@ -119,6 +124,8 @@ struct file_open_awaitable
   mode_t mode;
   int *file_fd_idx;
 
+  bool submit_success = false;
+
   Worker *io_worker = NULL;
   ConnectionTaskHandler handler;
 
@@ -142,6 +149,8 @@ struct file_close_awaitable
   int sock_fd_idx;
   int file_fd_idx;
 
+  bool submit_success = false;
+
   Worker *io_worker = NULL;
   ConnectionTaskHandler handler;
 
@@ -151,28 +160,29 @@ struct file_close_awaitable
 };
 inline auto file_close(int sock_fd_idx, int file_fd_idx)
 {
-  return file_close_awaitable {
-    .sock_fd_idx = sock_fd_idx,
-    .file_fd_idx = file_fd_idx
-  };
+  return file_close_awaitable{
+      .sock_fd_idx = sock_fd_idx,
+      .file_fd_idx = file_fd_idx};
 }
 
 // 读取磁盘文件
 struct file_read_awaitable
 {
   int sock_fd_idx;
-  int read_file_fd;
+  int read_file_fd_idx;
   int file_size;
   // 读取文件使用的buffer：fixed buffer或者temp buffer
   void **buf;
   // used_buffer_id=-1，表示使用temp buffer，否则为write buffer
   int *used_buffer_id;
-  // 读取buffer大小
-  int *bytes_num;
+  bool *read_success;
+  bool submit_success = false;
 
   // read、write操作发生在io_worker中
   Worker *io_worker = NULL;
   ConnectionTaskHandler handler;
+
+  bool fixed_file;
 
   bool await_ready();
   void await_suspend(ConnectionTaskHandler h);
@@ -180,15 +190,17 @@ struct file_read_awaitable
   bool await_resume();
 };
 // 读取磁盘文件
-inline auto file_read(int sock_fd_idx, int read_file_fd, int file_size,
-                      void **buf, int *used_buffer_id, int *bytes_num)
+inline auto file_read(int sock_fd_idx, int read_file_fd_idx, int file_size,
+                      void **buf, int *used_buffer_id,
+                      bool *read_success, bool fixed_file)
 {
   return file_read_awaitable{.sock_fd_idx = sock_fd_idx,
-                             .read_file_fd = read_file_fd,
+                             .read_file_fd_idx = read_file_fd_idx,
                              .file_size = file_size,
                              .buf = buf,
                              .used_buffer_id = used_buffer_id,
-                             .bytes_num = bytes_num};
+                             .read_success = read_success,
+                             .fixed_file = fixed_file};
 }
 
 // send file from file to socket
@@ -198,20 +210,26 @@ struct file_send_awaitable
   int read_file_fd_idx;
   int file_size;
   bool *is_success;
+  bool is_pipe_init = false;
   int pipefd[2];
 
+  bool submit_success = false;
   Worker *io_worker = NULL;
   ConnectionTaskHandler handler;
+
+  bool fixed_file;
 
   bool await_ready();
   void await_suspend(ConnectionTaskHandler h);
   bool await_resume();
 };
-inline auto file_send(int sock_fd_idx, int read_file_fd_idx, int file_size, bool *is_success)
+inline auto file_send(int sock_fd_idx, int read_file_fd_idx, int file_size, bool *is_success,
+                      bool fixed_file)
 {
   return file_send_awaitable{
       .sock_fd_idx = sock_fd_idx,
       .read_file_fd_idx = read_file_fd_idx,
       .file_size = file_size,
-      .is_success = is_success};
+      .is_success = is_success,
+      .fixed_file = fixed_file};
 }

@@ -204,8 +204,7 @@ private:
   // 提交multishot_accept请求
   void add_multishot_accept(int listen_fd);
   // 提交multishot_recv请求
-  void add_recv(int sock_fd_idx, ConnectionTaskHandler handler,
-                bool poll_first);
+  bool add_recv(int sock_fd_idx, ConnectionTaskHandler handler, bool poll_first);
   // 提交send_zc请求
   struct send_buf_info
   {
@@ -218,7 +217,7 @@ private:
       int sock_fd_idx, ConnectionTaskHandler handler,
       const std::list<send_buf_info> &buf_infos);
   // 关闭连接（提交close请求）
-  void disconnect(int sock_fd_idx, ConnectionTaskHandler handler);
+  bool disconnect(int sock_fd_idx, ConnectionTaskHandler handler);
   // 扩展写缓存池
   void extend_write_buffer_pool(int extend_buf_num);
   // 回收prov_buf
@@ -230,12 +229,11 @@ private:
   // 获取buf
   void *get_write_buf(int buf_id);
   void *get_prov_buf(int buf_id);
-  // 将序列化后的buffer发送给客户端
-  void send_to_client(int sock_fd_idx,
+  // 将序列化后的buffer发送给客户端, 返回是否成功
+  bool send_to_client(int sock_fd_idx,
                       std::list<boost::asio::const_buffer> &serialized_buffers,
                       std::list<send_buf_info> &buf_infos,
-                      ConnectionTaskHandler h, bool &send_submitted,
-                      const std::map<const void *, int> &used_write_buf);
+                      ConnectionTaskHandler h, const std::map<const void *, int> &used_write_buf);
   int get_worker_id();
   // 添加process任务至work-stealing-queue
   void add_process_task(ConnectionTaskHandler h);
@@ -246,16 +244,19 @@ private:
   // 处理accept请求
   void handle_accept(const struct io_uring_cqe *cqe);
   // 提交read请求
-  void add_read(int sock_fd_idx, int read_file_fd, int file_size, void **buf, int buf_idx);
+  void add_read(int sock_fd_idx, int read_file_fd_idx, int file_size,
+                void **buf, int buf_idx, bool fixed);
   // 读取文件
-  void read_file(int sock_fd_idx, int read_file_fd, int file_size, int *used_buffer_id, void **buf);
+  bool read_file(int sock_fd_idx, int read_file_fd_idx, int file_size,
+                 int *used_buffer_id, void **buf, bool fixed);
   // 打开文件
-  void open_file_direct(int sock_fd_idx, const std::string &path, mode_t mode);
+  bool open_file_direct(int sock_fd_idx, const std::string &path, mode_t mode);
   // 关闭文件
-  void close_direct_file(int sock_fd_idx, int file_fd_idx);
+  bool close_direct_file(int sock_fd_idx, int file_fd_idx);
   // sendfile
-  void sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
-                std::map<int, bool> &sendfile_sqe_complete, int *pipefd);
+  bool sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
+                std::map<int, bool> &sendfile_sqe_complete, int *pipefd,
+                bool fixed_file);
 
 public:
   Worker(int worker_id, ProcessFuncType processor, Service *service);
