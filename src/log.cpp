@@ -202,8 +202,18 @@ Logger::Logger(const std::string &log_dir,
     if (logname.empty())
       UtilError::error_exit("a logname is empty", false);
 
-    // 创建并打开只追加写的文件
+    // filename
     std::string filename = log_dir_ + '/' + logname + ".log";
+
+    // 如果config要求删除历史日志则删除文件
+    if (config::force_get_int("CLEAN_LOG_ON_START") && UtilFile::file_exists(filename))
+    {
+      bool success = UtilFile::file_remove(filename);
+      if (!success)
+        UtilError::error_exit("clean history log failed", true);
+    }
+
+    // 创建并打开只追加写的文件
     int fd = open(filename.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0777);
     if (fd == -1)
       UtilError::error_exit("create/open file " + logname + " failed", true);

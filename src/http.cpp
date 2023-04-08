@@ -82,9 +82,6 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       response.set(http::field::content_type, "text/html");
       response.keep_alive(false);
       response.body() = "bad request: error while parsing http request";
-
-      // 跳到serialize-send阶段，直接发送错误响应
-      break;
     }
 
     // 将控制权交还给io_worker
@@ -256,8 +253,9 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     }
 
     // 返回数据给客户端
+    std::map<const void *,int> debug;
     bool finish_send = false, send_error_occurs = false;
-    auto awaitable_send = socket_send(sock_fd_idx, buffers, send_error_occurs, web_file_used_buf);
+    auto awaitable_send = socket_send(sock_fd_idx, buffers, send_error_occurs, debug);
     while (!finish_send)
     {
       Log::debug("co_await awaitable_send with sock_fd_idx=", sock_fd_idx);
@@ -274,13 +272,6 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     {
       serializer->consume(data_to_consume);
       delete serializer;
-    }
-
-    // 清理read-write模式中使用的buffer
-    for (auto it : web_file_used_buf)
-    {
-      if (it.second == -1)
-        delete (char *)const_cast<void *>(it.first);
     }
 
     // 如果是splice模式，前面只发送了header，现在body部分需要通过splice来实现file到socket的零拷贝发送

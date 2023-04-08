@@ -66,20 +66,15 @@ private:
   const int max_log_len = 512;                     // 单则日志最大长度
   std::unordered_map<LogName, FileInfo> log_files; // 从日志名到日志文件的映射
 
-  const int init_buffer_capacity_; // 初始缓存容量
-  const int
-      max_fixed_buffer_capacity_;      // buffer数量不够时会动态增长，但是不超过上限
-  std::atomic<int> unused_buffer_num_; // 可用缓存数量
-  boost::lockfree::queue<BufferInfo *> unused_buffer_{
-      (size_t)init_buffer_capacity_}; // 缓存池中未被使用的buffer
-  std::atomic<int> new_buffer_index_{
-      0}; // 注册入内核的buffer_index，保证唯一性
+  const int init_buffer_capacity_;                                                    // 初始缓存容量
+  const int max_fixed_buffer_capacity_;                                               // buffer数量不够时会动态增长，但是不超过上限
+  std::atomic<int> unused_buffer_num_;                                                // 可用缓存数量
+  boost::lockfree::queue<BufferInfo *> unused_buffer_{(size_t)init_buffer_capacity_}; // 缓存池中未被使用的buffer
+  std::atomic<int> new_buffer_index_{0};                                              // 注册入内核的buffer_index，保证唯一性
 
-  boost::lockfree::queue<LogTask> unsubmitted_tasks_{
-      (size_t)init_buffer_capacity_};         // 未提交的日志任务
-  std::atomic<int> unsubmitted_tasks_num_{0}; // 未提交日志任务的数量
-  std::atomic<int> submitted_unconsumed_task_num_{
-      0}; // 已提交到io_uring但未收割的任务数量
+  boost::lockfree::queue<LogTask>unsubmitted_tasks_{(size_t)init_buffer_capacity_}; // 未提交的日志任务
+  std::atomic<int> unsubmitted_tasks_num_{0};            // 未提交日志任务的数量
+  std::atomic<int> submitted_unconsumed_task_num_{0};    // 已提交到io_uring但未收割的任务数量
 
   struct io_uring ring_;                   // io_uring实例
   std::recursive_mutex io_uring_sq_mutex_; // 锁，保证只有一个线程操作sqe

@@ -46,6 +46,11 @@ namespace UtilFile
     return access(path.c_str(), F_OK) != -1;
   }
 
+  static bool file_remove(const std::string &path)
+  {
+    return remove(path.c_str()) == 0;
+  }
+
   static int is_valid_fd(int fd)
   {
     return fcntl(fd, F_GETFL) != -1 || errno != EBADF;
