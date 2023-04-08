@@ -253,9 +253,8 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     }
 
     // 返回数据给客户端
-    std::map<const void *,int> debug;
     bool finish_send = false, send_error_occurs = false;
-    auto awaitable_send = socket_send(sock_fd_idx, buffers, send_error_occurs, debug);
+    auto awaitable_send = socket_send(sock_fd_idx, buffers, send_error_occurs, web_file_used_buf);
     while (!finish_send)
     {
       Log::debug("co_await awaitable_send with sock_fd_idx=", sock_fd_idx);
