@@ -394,6 +394,7 @@ bool file_close_awaitable::await_resume()
     Log::error("close file direct failed, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", file_fd_idx,
                "|cqe.res=", cqe.res);
     UtilError::error_exit("close file failed", false);
+    return true;
   }
   else
   {

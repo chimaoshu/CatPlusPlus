@@ -323,6 +323,7 @@ bool Worker::send_to_client(
 
   // 不会到达这里
   assert(false);
+  return false;
 }
 
 int Worker::get_worker_id() { return self_worker_id_; }
