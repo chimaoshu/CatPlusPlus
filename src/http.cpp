@@ -136,8 +136,9 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
 
         // web file size大于阈值使用splice进行发送
         static int splice_threshold = config::force_get_int("SPLICE_THRESHOLD");
-        use_splice_to_transfer_body = ((web_server_file_fd != -1) &&
-                                       (web_server_file_size > splice_threshold));
+        use_splice_to_transfer_body = ((splice_threshold != -1) &&
+                                       (web_server_file_fd != -1) &&
+                                       (web_server_file_size >= splice_threshold));
 
         assert(web_server_file_fd != -1);
         assert(!bad_request);
