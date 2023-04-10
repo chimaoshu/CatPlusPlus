@@ -1,10 +1,11 @@
 #include "worker.h"
 
+#include <netinet/tcp.h>
 #include <string.h>
 
 #include <boost/beast/core/make_printable.hpp>
-#include <typeinfo>
 #include <iostream>
+#include <typeinfo>
 
 #include "awaitable.h"
 #include "http.h"
@@ -53,9 +54,8 @@ bool Worker::add_recv(int sock_fd_idx, ConnectionTaskHandler handler,
 
 // 提交send_zc请求
 // 调用处检查sqe是否足够
-void Worker::add_zero_copy_send(
-    int sock_fd_idx, ConnectionTaskHandler handler,
-    const std::list<send_buf_info> &buf_infos)
+void Worker::add_zero_copy_send(int sock_fd_idx, ConnectionTaskHandler handler,
+                                const std::list<send_buf_info> &buf_infos)
 {
   // 循环准备SQE，使用IOSQE_IO_LINK串联起来
   int req_id = 0;
@@ -66,19 +66,20 @@ void Worker::add_zero_copy_send(
   {
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     FORCE_ASSERT(sqe != NULL);
-    Log::debug("add zero copy send, sock_fd_idx=", sock_fd_idx, "|write_buf_id=", buf_info.buf_id);
+    Log::debug("add zero copy send, sock_fd_idx=", sock_fd_idx,
+               "|write_buf_id=", buf_info.buf_id);
 
     // 填充sqe
     if (buf_info.buf_id != -1)
     {
       assert(write_buffer_pool_[buf_info.buf_id] == buf_info.buf);
-      io_uring_prep_send_zc_fixed(
-          sqe, sock_fd_idx, buf_info.buf,
-          buf_info.len, MSG_WAITALL, 0, buf_info.buf_id);
+      io_uring_prep_send_zc_fixed(sqe, sock_fd_idx, buf_info.buf, buf_info.len,
+                                  MSG_WAITALL, 0, buf_info.buf_id);
     }
     else
     {
-      io_uring_prep_send_zc(sqe, sock_fd_idx, buf_info.buf, buf_info.len, MSG_WAITALL, 0);
+      io_uring_prep_send_zc(sqe, sock_fd_idx, buf_info.buf, buf_info.len,
+                            MSG_WAITALL, 0);
     }
     sqe->flags |= IOSQE_FIXED_FILE;
 
@@ -89,13 +90,13 @@ void Worker::add_zero_copy_send(
 
     // 后续用于判断是否各SQE都完成了，才能恢复协程
     handler.promise().send_sqe_complete[req_id] = false;
-    Log::debug("add send_sqe_complete req_id, sock_fd_idx=", sock_fd_idx, "|req_id=", req_id);
+    Log::debug("add send_sqe_complete req_id, sock_fd_idx=", sock_fd_idx,
+               "|req_id=", req_id);
 
     // user data
-    IORequestInfo req_info{
-        .fd = sock_fd_idx,
-        .req_id = static_cast<int16_t>(req_id),
-        .type = SEND_SOCKET};
+    IORequestInfo req_info{.fd = sock_fd_idx,
+                           .req_id = static_cast<int16_t>(req_id),
+                           .type = SEND_SOCKET};
     memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
     req_id++;
   }
@@ -444,8 +445,12 @@ Worker::Worker(int worker_id, ProcessFuncType processor, Service *service)
     UtilError::error_exit("socket failed", true);
   {
     int optval = 1;
-    if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEPORT, &optval,
-                   sizeof(optval)) < 0)
+
+    bool enable_nodelay = config::force_get_int("TCP_NODELAY");
+    int flags = SO_REUSEPORT | SO_REUSEADDR;
+    if (enable_nodelay)
+      flags |= TCP_NODELAY;
+    if (setsockopt(listen_fd_, SOL_SOCKET, flags, &optval, sizeof(optval)) < 0)
       UtilError::error_exit("setsockopt failed", true);
 
     struct sockaddr_in server_addr;
@@ -524,9 +529,10 @@ Worker::Worker(int worker_id, ProcessFuncType processor, Service *service)
       // 资源不足
       if (ret == -ENOMEM)
       {
-        UtilError::error_exit("ENOMEM: insufficient kernel resouces, reigster"
-                              " buffer failed. Try using ulimit -l to set a larger memlcok",
-                              false);
+        UtilError::error_exit(
+            "ENOMEM: insufficient kernel resouces, reigster"
+            " buffer failed. Try using ulimit -l to set a larger memlcok",
+            false);
       }
       else if (ret < 0)
       {
@@ -581,7 +587,8 @@ void Worker::add_read(int sock_fd_idx, int read_file_fd_idx, int file_size,
   io_uring_submit(&ring);
 }
 
-bool Worker::open_file_direct(int sock_fd_idx, const std::string &path, mode_t mode)
+bool Worker::open_file_direct(int sock_fd_idx, const std::string &path,
+                              mode_t mode)
 {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
   if (sqe == NULL)
@@ -596,9 +603,8 @@ bool Worker::open_file_direct(int sock_fd_idx, const std::string &path, mode_t m
 }
 
 // 读取文件
-bool Worker::read_file(
-    int sock_fd_idx, int read_file_fd_idx, int file_size,
-    int *used_buffer_id, void **buf, bool fixed_file)
+bool Worker::read_file(int sock_fd_idx, int read_file_fd_idx, int file_size,
+                       int *used_buffer_id, void **buf, bool fixed_file)
 {
   if (io_uring_sq_space_left(&ring) < 1)
   {
@@ -714,7 +720,8 @@ bool Worker::sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     last_sqe = sqe;
     FORCE_ASSERT(sqe != NULL);
-    io_uring_prep_splice(sqe, file_fd_idx, -1, pipefd[1], -1, nbytes, SPLICE_F_MOVE | SPLICE_F_MORE);
+    io_uring_prep_splice(sqe, file_fd_idx, -1, pipefd[1], -1, nbytes,
+                         SPLICE_F_MOVE | SPLICE_F_MORE);
     if (fixed_file)
       sqe->splice_flags |= SPLICE_F_FD_IN_FIXED;
     sqe->flags |= IOSQE_IO_LINK;
@@ -729,7 +736,8 @@ bool Worker::sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
     struct io_uring_sqe *sqe2 = io_uring_get_sqe(&ring);
     last_sqe = sqe2;
     FORCE_ASSERT(sqe2 != NULL);
-    io_uring_prep_splice(sqe2, pipefd[0], -1, sock_fd_idx, -1, nbytes, SPLICE_F_MOVE | SPLICE_F_MORE);
+    io_uring_prep_splice(sqe2, pipefd[0], -1, sock_fd_idx, -1, nbytes,
+                         SPLICE_F_MOVE | SPLICE_F_MORE);
     sqe2->flags |= IOSQE_FIXED_FILE;
     sqe2->flags |= IOSQE_IO_LINK;
     // IORequestInfo
@@ -739,9 +747,7 @@ bool Worker::sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
     sendfile_sqe_complete[req_id] = false;
     req_id++;
 
-    Log::debug("add splice, sock_fd_idx=", sock_fd_idx,
-               "|file_fd_idx=", file_fd_idx,
-               "|nbytes=", nbytes);
+    Log::debug("add splice, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", file_fd_idx, "|nbytes=", nbytes);
   }
 
   // 最后一个不设置IO_LINK, SPLICE_F_MORE
@@ -864,8 +870,7 @@ void Worker::run()
         if (current_io != io_type)
         {
           Log::error("skip sqe process, sock_fd_idx=", info.fd,
-                     "|current_io=", current_io,
-                     "|cqe_io_type=", io_type);
+                     "|current_io=", current_io, "|cqe_io_type=", io_type);
           continue;
         }
       }
@@ -933,7 +938,8 @@ void Worker::run()
         }
         else
         {
-          Log::debug("process send cqe and not need to resume, sock_fd_idx=", info.fd, "|req_id=", info.req_id);
+          Log::debug("process send cqe and not need to resume, sock_fd_idx=",
+                     info.fd, "|req_id=", info.req_id);
         }
         break;
       }
@@ -961,8 +967,7 @@ void Worker::run()
         else
         {
           Log::error("senfile failed, need resume, sock_fd_idx=", info.fd,
-                     "|cqe->res=", cqe->res,
-                     "|req_id=", info.req_id);
+                     "|cqe->res=", cqe->res, "|req_id=", info.req_id);
           resume = true;
         }
 
