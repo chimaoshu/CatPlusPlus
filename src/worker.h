@@ -111,9 +111,15 @@ struct process_func_args
   std::string file_path;
 };
 
-using ProcessFuncType =
+using ProcessFuncStringBody =
     std::function<int(http::request<http::string_body> &, http::response<http::string_body> &,
                       process_func_args &args)>;
+
+using ProcessFuncBufferBody =
+    std::function<int(http::request<http::string_body> &, http::response<http::buffer_body> &,
+                      process_func_args &args)>;
+
+using ProcessFuncType = std::variant<ProcessFuncStringBody, ProcessFuncBufferBody>;
 
 struct IORequestInfo
 {

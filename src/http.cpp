@@ -65,8 +65,22 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     bool bad_request = !parser.is_done();
     if (!bad_request)
     {
+      // 根据开发者定义不同body类型进行处理
       request = parser.release();
-      processor(request, response, args);
+      if (std::holds_alternative<ProcessFuncStringBody>(processor))
+      {
+        use_buf_body = false;
+        std::get<ProcessFuncStringBody>(processor)(request, response, args);
+      }
+      else if (std::holds_alternative<ProcessFuncBufferBody>(processor))
+      {
+        use_buf_body = true;
+        std::get<ProcessFuncBufferBody>(processor)(request, response_buf, args);
+      }
+      else
+      {
+        FORCE_ASSERT(false);
+      }
     }
     // 解析失败
     else
@@ -82,6 +96,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       response.set(http::field::content_type, "text/html");
       response.keep_alive(false);
       response.body() = "bad request: error while parsing http request";
+      use_buf_body = false;
     }
 
     // 将控制权交还给io_worker
@@ -129,6 +144,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
           response.keep_alive(request.keep_alive());
           response.result(http::status::not_found);
           response.body() = "404 not found";
+          use_buf_body = false;
 
           // 跳到serialize-send阶段，直接发送错误响应
           break;
@@ -180,7 +196,6 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
           if (read_success)
           {
             web_file_used_buf[buf] = used_buf_id;
-            use_buf_body = true;
 
             // header
             response_buf.set(http::field::content_type, "text/html");
@@ -195,6 +210,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
             response_buf.body().data = buf;
             response_buf.body().size = web_server_file_size;
             response_buf.body().more = false;
+            use_buf_body = true;
           }
           // 读取失败
           else if (!read_success)
@@ -204,6 +220,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
             response.keep_alive(request.keep_alive());
             response.result(http::status::not_found);
             response.body() = "404 not found";
+            use_buf_body = false;
           }
 
           // 关闭文件 direct
@@ -261,6 +278,9 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       Log::debug("co_await awaitable_send with sock_fd_idx=", sock_fd_idx);
       finish_send = co_await awaitable_send;
     }
+
+    // TODO: 考虑加个callback函数，或者PorcessFuncArg里面加个变量
+    // 可以销毁buffer body使用的buffer
 
     // 清理serializer数据
     if (use_buf_body)

@@ -32,5 +32,14 @@ else()
     TARGET_COMPILE_OPTIONS(web_server PRIVATE -fcoroutines -O0 -g)
 endif()
 
+# io_test_server
+ADD_EXECUTABLE(io_test_server src/log.cpp src/worker.cpp src/http.cpp src/awaitable.cpp examples/io_test_server.cpp)
+TARGET_LINK_LIBRARIES(io_test_server uring pthread)
+if (CMAKE_BUILD_TYPE AND (CMAKE_BUILD_TYPE STREQUAL "Release"))
+    TARGET_COMPILE_OPTIONS(io_test_server PRIVATE -fcoroutines -O3 -DPRODUCTION)
+else()
+    TARGET_COMPILE_OPTIONS(io_test_server PRIVATE -fcoroutines -O0 -g)
+endif()
+
 SET(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin)
 MESSAGE("PROJECT_SOURCE_DIR=${PROJECT_SOURCE_DIR}")
