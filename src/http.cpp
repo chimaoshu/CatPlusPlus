@@ -1,6 +1,8 @@
 #include "http.h"
 #include "awaitable.h"
 
+#include <sys/sendfile.h>
+
 #include <filesystem>
 
 #include <boost/beast/http/span_body.hpp>
@@ -47,7 +49,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     // 构造response
     http::request<http::string_body> request;
     http::response<http::string_body> response;
-    bool use_splice_to_transfer_body = false;
+    bool use_sendfile_to_transfer_body = false;
 
     bool use_buf_body = false;
     http::response<http::buffer_body> response_buf;
@@ -120,6 +122,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
         // 打开文件，使用direct_file
         if (use_direct_file)
         {
+          // TODO: 非direct file也支持使用异步打开
           auto open_awaitable = file_open(sock_fd_idx, args.file_path, O_RDONLY, &web_server_file_fd);
           bool finish_open = false;
           while (!finish_open)
@@ -150,19 +153,19 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
           break;
         }
 
-        // web file size大于阈值使用splice进行发送
-        static int splice_threshold = config::force_get_int("SPLICE_THRESHOLD");
-        use_splice_to_transfer_body = ((splice_threshold != -1) &&
-                                       (web_server_file_fd != -1) &&
-                                       (web_server_file_size >= splice_threshold));
+        // web file size大于阈值使用sendfile进行发送
+        static int sendfile_threshold = config::force_get_int("SENDFILE_THRESHOLD");
+        use_sendfile_to_transfer_body = ((sendfile_threshold != -1) &&
+                                         (web_server_file_fd != -1) &&
+                                         (web_server_file_size >= sendfile_threshold));
 
         assert(web_server_file_fd != -1);
         assert(!bad_request);
         assert(args.use_web_server);
 
-        // 使用splice传输body，此处只要构造header，后续只要序列化并send header
-        // send header 结束后再使用splice传输body
-        if (use_splice_to_transfer_body)
+        // 使用sendfile传输body，此处只要构造header，后续只要序列化并send header
+        // send header 结束后再使用sendfile传输body
+        if (use_sendfile_to_transfer_body)
         {
           // header
           response.version(request.version());
@@ -174,8 +177,8 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
           break;
         }
 
-        // 不使用splice模式，而是使用read+send模式
-        else if (!use_splice_to_transfer_body)
+        // 不使用sendfile模式，而是使用read+send模式
+        else if (!use_sendfile_to_transfer_body)
         {
           void *buf = NULL;
           int used_buf_id = -1;
@@ -247,17 +250,17 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     http::response_serializer<http::buffer_body> *serializer_buf = NULL;
     if (use_buf_body)
     {
-      if (!use_splice_to_transfer_body)
+      if (!use_sendfile_to_transfer_body)
         response_buf.prepare_payload();
       serializer_buf = new http::response_serializer<http::buffer_body>(response_buf);
-      serialize(serializer_buf, buffers, ec, data_to_consume, use_splice_to_transfer_body);
+      serialize(serializer_buf, buffers, ec, data_to_consume, use_sendfile_to_transfer_body);
     }
     else
     {
-      if (!use_splice_to_transfer_body)
+      if (!use_sendfile_to_transfer_body)
         response.prepare_payload();
       serializer = new http::response_serializer<http::string_body>(response);
-      serialize(serializer, buffers, ec, data_to_consume, use_splice_to_transfer_body);
+      serialize(serializer, buffers, ec, data_to_consume, use_sendfile_to_transfer_body);
     }
 
     // 序列化出错，直接关闭连接
@@ -294,28 +297,55 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       delete serializer;
     }
 
-    // 如果是splice模式，前面只发送了header，现在body部分需要通过splice来实现file到socket的零拷贝发送
-    if (use_splice_to_transfer_body && !send_error_occurs)
+    // 如果是sendfile模式，前面只发送了header，现在body部分需要通过sendfile来实现file到socket的零拷贝发送
+    if (use_sendfile_to_transfer_body && !send_error_occurs)
     {
       bool is_success = false;
-      bool finish_sendfile = false;
-      auto file_send_awaitable = file_send(sock_fd_idx, web_server_file_fd,
-                                           web_server_file_size, &is_success,
-                                           use_direct_file);
-      while (!finish_sendfile)
+
+      // 是否使用异步的sendfile（目前需要使用splice实现）
+      static bool use_async_sendfile = config::force_get_int("USE_ASYNC_SENDFILE");
+      if (use_async_sendfile)
       {
-        Log::debug("co_await file_send, sock_fd_idx=", sock_fd_idx);
-        finish_sendfile = co_await file_send_awaitable;
+        bool finish_sendfile = false;
+        auto file_send_awaitable = file_send(sock_fd_idx, web_server_file_fd,
+                                             web_server_file_size, &is_success,
+                                             use_direct_file);
+        while (!finish_sendfile)
+        {
+          Log::debug("co_await file_send, sock_fd_idx=", sock_fd_idx);
+          finish_sendfile = co_await file_send_awaitable;
+        }
+      }
+      // 使用同步的sendfile，这将阻塞工作线程
+      else
+      {
+        // 使用direct file的话无法使用sendfile
+        if (use_direct_file)
+          UtilError::error_exit("config error: USE_DIRECT_FILE must be disable if USE_ASYNC_SENDFILE is disable", false);
+
+        int ret = sendfile(sock_fd_idx, web_server_file_fd, NULL, web_server_file_size);
+        if (ret == -1)
+        {
+          Log::error("sync sendfile failed, sock_fd_idx=", sock_fd_idx,
+                     "|ret=", ret,
+                     "|file_fd=", web_server_file_fd);
+          is_success = false;
+        }
+        else
+        {
+          Log::debug("sync sendfile success, sock_fd_idx=", sock_fd_idx);
+          is_success = true;
+        }
       }
 
       if (is_success)
       {
-        Log::debug("splice send success, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", web_server_file_fd);
+        Log::debug("sendfile send success, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", web_server_file_fd);
         send_error_occurs = false;
       }
       else
       {
-        Log::error("splice send failed, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", web_server_file_fd);
+        Log::error("sendfile send failed, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", web_server_file_fd);
         send_error_occurs = true;
       }
 

@@ -15,9 +15,13 @@ void Worker::add_multishot_accept(int listen_fd)
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
   FORCE_ASSERT(sqe != NULL);
 
+  static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
+
   // 设置SQE
-  io_uring_prep_multishot_accept_direct(sqe, listen_fd, &client_addr,
-                                        &client_len, 0);
+  if (use_direct_file)
+    io_uring_prep_multishot_accept_direct(sqe, listen_fd, &client_addr, &client_len, 0);
+  else
+    io_uring_prep_multishot_accept(sqe, listen_fd, &client_addr, &client_len, 0);
 
   // 设置user_data
   IORequestInfo req_info{.fd = listen_fd, .req_id = 0, .type = ACCEPT};
@@ -37,9 +41,12 @@ bool Worker::add_recv(int sock_fd_idx, ConnectionTaskHandler handler,
   if (sqe == NULL)
     return false;
 
+  static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
+
   io_uring_prep_recv(sqe, sock_fd_idx, NULL, 0, 0);
   sqe->buf_group = 0;
-  sqe->flags |= IOSQE_FIXED_FILE;
+  if (use_direct_file)
+    sqe->flags |= IOSQE_FIXED_FILE;
   sqe->flags |= IOSQE_BUFFER_SELECT;
   sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
 
@@ -81,7 +88,10 @@ void Worker::add_zero_copy_send(int sock_fd_idx, ConnectionTaskHandler handler,
       io_uring_prep_send_zc(sqe, sock_fd_idx, buf_info.buf, buf_info.len,
                             MSG_WAITALL, 0);
     }
-    sqe->flags |= IOSQE_FIXED_FILE;
+
+    static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
+    if (use_direct_file)
+      sqe->flags |= IOSQE_FIXED_FILE;
 
     // 长度大于1则需要链接，以保证先后顺序，最后一个不设置，表示链接结束
     // 设置也无所谓，因为IO_SQE_LINK的影响不会跨越submit
@@ -115,7 +125,11 @@ bool Worker::disconnect(int sock_fd_idx, ConnectionTaskHandler handler)
   if (sqe == NULL)
     return false;
 
-  io_uring_prep_close_direct(sqe, sock_fd_idx);
+  static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
+  if (use_direct_file)
+    io_uring_prep_close_direct(sqe, sock_fd_idx);
+  else
+    io_uring_prep_close(sqe, sock_fd_idx);
   IORequestInfo req_info{.fd = sock_fd_idx, .req_id = 0, .type = CLOSE_SOCKET};
   memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
   return true;
@@ -576,6 +590,7 @@ void Worker::add_read(int sock_fd_idx, int read_file_fd_idx, int file_size,
     io_uring_prep_read(sqe, read_file_fd_idx, *buf, file_size, 0);
   }
 
+  // TODO：重构使用USE_DIRECT_FILE
   if (fixed_file)
     sqe->flags |= IOSQE_FIXED_FILE;
 
@@ -738,7 +753,9 @@ bool Worker::sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
     FORCE_ASSERT(sqe2 != NULL);
     io_uring_prep_splice(sqe2, pipefd[0], -1, sock_fd_idx, -1, nbytes,
                          SPLICE_F_MOVE | SPLICE_F_MORE);
-    sqe2->flags |= IOSQE_FIXED_FILE;
+    // TODO：重构
+    if (fixed_file)
+      sqe2->flags |= IOSQE_FIXED_FILE;
     sqe2->flags |= IOSQE_IO_LINK;
     // IORequestInfo
     IORequestInfo req_info2{.fd = sock_fd_idx, .req_id = req_id, .type = SEND_FILE};
@@ -781,6 +798,53 @@ void Worker::run()
   {
     ConnectionTaskHandler handler;
 
+    static bool enable_work_stealing = config::force_get_int("ENABLE_WORK_STEALING");
+
+    // 优先处理io task
+    bool have_task = false;
+    if (try_get_io_task_queue(handler))
+    {
+      Log::debug("get a task from private worker_id=", self_worker_id_);
+      have_task = true;
+    }
+    // 从本地ws队列取（process task）
+    else if (ws_process_task_queue.pop(handler))
+    {
+      Log::debug("get a task from wsq worker_id=", self_worker_id_);
+      handler.promise().process_worker = this;
+      have_task = true;
+    }
+    // 本地队列没有，就去全局队列取
+    else if (enable_work_stealing && service_->global_queue.pop(handler))
+    {
+      Log::debug("get a task from global queue worker_id=", self_worker_id_);
+      handler.promise().process_worker = this;
+      have_task = true;
+    }
+    // 全局队列没有，就从其他worker的队列偷
+    else if (enable_work_stealing)
+    {
+      for (int worker_id = 0; worker_id < service_->worker_num; worker_id++)
+      {
+        if (worker_id == self_worker_id_)
+          continue;
+        if (service_->workers[worker_id]->ws_process_task_queue.pop(handler))
+        {
+          Log::debug("get a task from worker with worker_id=", worker_id);
+          handler.promise().process_worker = this;
+          have_task = true;
+          break;
+        }
+      }
+    }
+
+    // 有任务
+    if (have_task)
+    {
+      handler.resume();
+      continue;
+    }
+
     struct io_uring_cqe *cqe;
     int head, count = 0;
     // wait for 50ms
@@ -798,48 +862,6 @@ void Worker::run()
     // io_uring没有cqe，则从队列中取
     if (!cqe)
     {
-      // 优先处理io task
-      bool have_task = false;
-      if (try_get_io_task_queue(handler))
-      {
-        Log::debug("get a task from private worker_id=", self_worker_id_);
-        have_task = true;
-      }
-      // 从本地ws队列取（process task）
-      else if (ws_process_task_queue.pop(handler))
-      {
-        Log::debug("get a task from wsq worker_id=", self_worker_id_);
-        handler.promise().process_worker = this;
-        have_task = true;
-      }
-      // 本地队列没有，就去全局队列取
-      else if (service_->global_queue.pop(handler))
-      {
-        Log::debug("get a task from global queue worker_id=", self_worker_id_);
-        handler.promise().process_worker = this;
-        have_task = true;
-      }
-      // 全局队列没有，就从其他worker的队列偷
-      else
-      {
-        for (int worker_id = 0; worker_id < service_->worker_num; worker_id++)
-        {
-          if (worker_id == self_worker_id_)
-            continue;
-          if (service_->workers[worker_id]->ws_process_task_queue.pop(handler))
-          {
-            Log::debug("get a task from worker with worker_id=", worker_id);
-            handler.promise().process_worker = this;
-            have_task = true;
-            break;
-          }
-        }
-      }
-
-      // 有任务
-      if (have_task)
-        handler.resume();
-
       // 进入下一轮循环
       continue;
     }
@@ -871,8 +893,9 @@ void Worker::run()
         // 例如connection reset，然后这边close之后，再收到之前还没发完的send请求
         if (current_io != io_type)
         {
-          Log::error("skip sqe process, sock_fd_idx=", info.fd,
-                     "|current_io=", current_io, "|cqe_io_type=", io_type);
+          Log::warn("skip sqe process, sock_fd_idx=", info.fd,
+                    "|current_io=", current_io,
+                    "|cqe_io_type=", io_type);
           continue;
         }
       }

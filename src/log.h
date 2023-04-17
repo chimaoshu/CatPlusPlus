@@ -72,9 +72,9 @@ private:
   boost::lockfree::queue<BufferInfo *> unused_buffer_{(size_t)init_buffer_capacity_}; // 缓存池中未被使用的buffer
   std::atomic<int> new_buffer_index_{0};                                              // 注册入内核的buffer_index，保证唯一性
 
-  boost::lockfree::queue<LogTask>unsubmitted_tasks_{(size_t)init_buffer_capacity_}; // 未提交的日志任务
-  std::atomic<int> unsubmitted_tasks_num_{0};            // 未提交日志任务的数量
-  std::atomic<int> submitted_unconsumed_task_num_{0};    // 已提交到io_uring但未收割的任务数量
+  boost::lockfree::queue<LogTask> unsubmitted_tasks_{(size_t)init_buffer_capacity_}; // 未提交的日志任务
+  std::atomic<int> unsubmitted_tasks_num_{0};                                        // 未提交日志任务的数量
+  std::atomic<int> submitted_unconsumed_task_num_{0};                                // 已提交到io_uring但未收割的任务数量
 
   struct io_uring ring_;                   // io_uring实例
   std::recursive_mutex io_uring_sq_mutex_; // 锁，保证只有一个线程操作sqe
@@ -166,11 +166,13 @@ private:
 public:
 #ifdef PRODUCTION
   CREATE_EMPTY_LOGGER_FUNCTION(debug)
+  CREATE_EMPTY_LOGGER_FUNCTION(info)
+  CREATE_EMPTY_LOGGER_FUNCTION(warn)
 #else
   CREATE_LOGGER_FUNCTION(debug)
-#endif
   CREATE_LOGGER_FUNCTION(info)
   CREATE_LOGGER_FUNCTION(warn)
+#endif
   CREATE_LOGGER_FUNCTION(error)
 };
 
