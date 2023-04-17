@@ -779,53 +779,8 @@ void Worker::run()
   // 提交构造函数准备好的accept请求
   while (true)
   {
-    bool have_task = false;
     ConnectionTaskHandler handler;
-    // 优先处理io task
-    if (try_get_io_task_queue(handler))
-    {
-      Log::debug("get a task from private worker_id=", self_worker_id_);
-      have_task = true;
-    }
-    // 从本地ws队列取（process task）
-    else if (ws_process_task_queue.pop(handler))
-    {
-      Log::debug("get a task from wsq worker_id=", self_worker_id_);
-      handler.promise().process_worker = this;
-      have_task = true;
-    }
-    // 本地队列没有，就去全局队列取
-    else if (service_->global_queue.pop(handler))
-    {
-      Log::debug("get a task from global queue worker_id=", self_worker_id_);
-      handler.promise().process_worker = this;
-      have_task = true;
-    }
-    // 全局队列没有，就从其他worker的队列偷
-    else
-    {
-      for (int worker_id = 0; worker_id < service_->worker_num; worker_id++)
-      {
-        if (worker_id == self_worker_id_)
-          continue;
-        if (service_->workers[worker_id]->ws_process_task_queue.pop(handler))
-        {
-          Log::debug("get a task from worker with worker_id=", worker_id);
-          handler.promise().process_worker = this;
-          have_task = true;
-          break;
-        }
-      }
-    }
 
-    // 有任务
-    if (have_task)
-    {
-      handler.resume();
-      continue;
-    }
-
-    // 没任务，阻塞wait_cqe
     struct io_uring_cqe *cqe;
     int head, count = 0;
     // wait for 50ms
@@ -840,9 +795,56 @@ void Worker::run()
 #endif
     }
 
+    // io_uring没有cqe，则从队列中取
     if (!cqe)
-      continue;
+    {
+      // 优先处理io task
+      bool have_task = false;
+      if (try_get_io_task_queue(handler))
+      {
+        Log::debug("get a task from private worker_id=", self_worker_id_);
+        have_task = true;
+      }
+      // 从本地ws队列取（process task）
+      else if (ws_process_task_queue.pop(handler))
+      {
+        Log::debug("get a task from wsq worker_id=", self_worker_id_);
+        handler.promise().process_worker = this;
+        have_task = true;
+      }
+      // 本地队列没有，就去全局队列取
+      else if (service_->global_queue.pop(handler))
+      {
+        Log::debug("get a task from global queue worker_id=", self_worker_id_);
+        handler.promise().process_worker = this;
+        have_task = true;
+      }
+      // 全局队列没有，就从其他worker的队列偷
+      else
+      {
+        for (int worker_id = 0; worker_id < service_->worker_num; worker_id++)
+        {
+          if (worker_id == self_worker_id_)
+            continue;
+          if (service_->workers[worker_id]->ws_process_task_queue.pop(handler))
+          {
+            Log::debug("get a task from worker with worker_id=", worker_id);
+            handler.promise().process_worker = this;
+            have_task = true;
+            break;
+          }
+        }
+      }
 
+      // 有任务
+      if (have_task)
+        handler.resume();
+
+      // 进入下一轮循环
+      continue;
+    }
+
+    // 有就绪cqe，则进行处理
     io_uring_for_each_cqe(&ring, head, cqe)
     {
       count++;
