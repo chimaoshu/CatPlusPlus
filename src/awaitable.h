@@ -40,7 +40,7 @@ struct socket_send_awaitable
   std::list<boost::asio::const_buffer> &serialized_buffers;
 
   // 记录被用于send的buffer id，后续需要回收
-  std::list<Worker::send_buf_info> buf_infos;
+  std::list<struct send_buf_info> buf_infos;
 
   const std::map<const void *, int> &used_write_buf;
 

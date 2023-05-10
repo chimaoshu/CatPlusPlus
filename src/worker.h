@@ -15,6 +15,7 @@
 #include <boost/beast/http/parser.hpp>
 #include <boost/beast/http/serializer.hpp>
 #include <boost/beast/http/string_body.hpp>
+
 #include <boost/lockfree/queue.hpp>
 #include <coroutine>
 #include <list>
@@ -24,22 +25,9 @@
 
 #include "log.h"
 #include "util.hpp"
+#include "io_uring_wrapper.h"
 
 using namespace boost::beast;
-
-enum IOType : uint8_t
-{
-  ACCEPT,
-  RECV_SOCKET,
-  SEND_SOCKET,
-  CLOSE_SOCKET,
-  SHUTDOWN,
-  NONE,
-  READ_FILE,
-  OPEN_FILE,
-  CLOSE_FILE,
-  SEND_FILE
-};
 
 // cqe的柔性数组在c++20协程中会出问题
 // 因此定义一个没有柔性数组的cqe，在协程中使用
@@ -50,7 +38,6 @@ struct coroutine_cqe
   __u32 flags;
 };
 
-struct IORequestInfo;
 class Worker;
 struct ConnectionTask
 {
@@ -121,15 +108,6 @@ using ProcessFuncBufferBody =
 
 using ProcessFuncType = std::variant<ProcessFuncStringBody, ProcessFuncBufferBody>;
 
-struct IORequestInfo
-{
-  int fd;
-  // 对于使用io_link串联的写请求来说，需要记录串联请求的编号
-  int16_t req_id;
-  // IO类型
-  IOType type;
-};
-
 // 拷贝cqe
 void copy_cqe(struct coroutine_cqe &dest, struct io_uring_cqe &src);
 
@@ -153,21 +131,7 @@ public:
 class Worker
 {
 private:
-  const int max_conn_num_;                     // 最大连接数
-  const int io_uring_entries_;                 // io_uring sqe容量
-  const int max_fixed_file_num_;               // 最大注册文件数
-  const int max_buffer_num_;                   // 最大缓存数
-  const int self_worker_id_;                   // 工作线程唯一标识符
-  const int page_size = sysconf(_SC_PAGESIZE); // 系统页大小，作为缓存大小
-
-  std::vector<void *> read_buffer_pool_;  // 缓存池
-  std::vector<void *> write_buffer_pool_; // 缓存池
-
-  // 未使用的写缓存id，由于send只会由本工作线程提交，因此此处串行无锁，无需与log一样使用lock-free-queue
-  std::queue<int> unused_write_buffer_id_;
-  // 用于管理prov_buf的环状队列，称为buf ring
-  struct io_uring_buf_ring *buf_ring_ = NULL;
-
+  const int self_worker_id_; // 工作线程唯一标识符
   // 开启的连接，key为direct socket的index
   std::map<int, ConnectionTask> connections_;
 
@@ -176,24 +140,19 @@ private:
   // 包含global queue与其他worker信息
   Service *service_;
 
-  // 此字段没有用，因为multishot每次accept一个请求都会更新该字段，但是进行accept仍然需要该字段
-  struct sockaddr client_addr;
-  socklen_t client_len = sizeof(client_addr);
-
   // work stealing任务队列，结构无锁，可被其他worker访问
   // 只装process任务
-  boost::lockfree::queue<ConnectionTaskHandler,
-                         boost::lockfree::fixed_sized<true>>
-      ws_process_task_queue;
+  boost::lockfree::queue<ConnectionTaskHandler, boost::lockfree::fixed_sized<true>> ws_process_task_queue;
 
   // 本地私有队列，只有本worker访问，串行无锁，用于read与write请求的提交
   // 只装io任务
   boost::lockfree::queue<int> private_io_task_queue;
 
-  struct io_uring ring;
-
   // http处理器
   ProcessFuncType processor_;
+
+  // io_uring实例
+  IOUringWrapper io_uring_instance;
 
   // 各awaitable对象的友元声明
   friend struct socket_recv_awaitable;
@@ -206,40 +165,8 @@ private:
   friend struct file_close_awaitable;
   friend struct file_send_awaitable;
 
-private:
-  // 提交multishot_accept请求
-  void add_multishot_accept(int listen_fd);
-  // 提交multishot_recv请求
-  bool add_recv(int sock_fd_idx, ConnectionTaskHandler handler, bool poll_first);
+public:
   // 提交send_zc请求
-  struct send_buf_info
-  {
-    int buf_id;
-    const void *buf;
-    int len;
-    send_buf_info(int buf_id, const void *buf, int len) : buf_id(buf_id), buf(buf), len(len) {}
-  };
-  void add_zero_copy_send(
-      int sock_fd_idx, ConnectionTaskHandler handler,
-      const std::list<send_buf_info> &buf_infos);
-  // 关闭连接（提交close请求）
-  bool disconnect(int sock_fd_idx, ConnectionTaskHandler handler);
-  // 扩展写缓存池
-  void extend_write_buffer_pool(int extend_buf_num);
-  // 回收prov_buf
-  void retrive_prov_buf(int prov_buf_id);
-  // 回收write buf
-  void retrive_write_buf(int buf_id);
-  // 添加prov_buf
-  bool try_extend_prov_buf();
-  // 获取buf
-  void *get_write_buf(int buf_id);
-  void *get_prov_buf(int buf_id);
-  // 将序列化后的buffer发送给客户端, 返回是否成功
-  bool send_to_client(int sock_fd_idx,
-                      std::list<boost::asio::const_buffer> &serialized_buffers,
-                      std::list<send_buf_info> &buf_infos,
-                      ConnectionTaskHandler h, const std::map<const void *, int> &used_write_buf);
   int get_worker_id();
   // 添加process任务至work-stealing-queue
   void add_process_task(ConnectionTaskHandler h);
@@ -247,22 +174,10 @@ private:
   void add_io_resume_task(int sock_fd_idx);
   // 获取io resume task
   bool try_get_io_task_queue(ConnectionTaskHandler &h);
-  // 处理accept请求
+  IOUringWrapper &get_io_uring() { return io_uring_instance; }
+
+private:
   void handle_accept(const struct io_uring_cqe *cqe);
-  // 提交read请求
-  void add_read(int sock_fd_idx, int read_file_fd_idx, int file_size,
-                void **buf, int buf_idx, bool fixed);
-  // 读取文件
-  bool read_file(int sock_fd_idx, int read_file_fd_idx, int file_size,
-                 int *used_buffer_id, void **buf, bool fixed);
-  // 打开文件
-  bool open_file_direct(int sock_fd_idx, const std::string &path, mode_t mode);
-  // 关闭文件
-  bool close_direct_file(int sock_fd_idx, int file_fd_idx);
-  // sendfile
-  bool sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
-                std::map<int, bool> &sendfile_sqe_complete, int *pipefd,
-                bool fixed_file);
 
 public:
   Worker(int worker_id, ProcessFuncType processor, Service *service);

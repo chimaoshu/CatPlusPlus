@@ -11,7 +11,7 @@ void socket_recv_awaitable::await_suspend(ConnectionTaskHandler h)
 
   // 提交recv请求
   Log::debug("add recv at sock_fd_idx=", sock_fd_idx);
-  submit_success = io_worker->add_recv(sock_fd_idx, h, true);
+  submit_success = io_worker->get_io_uring().add_recv(sock_fd_idx, true);
   // FORCE_ASSERT(submit_success);
 
   if (!submit_success)
@@ -55,10 +55,10 @@ bool socket_recv_awaitable::await_resume()
 
     // 把buffer丢进parser
     error_code err;
-    parser.put(boost::asio::buffer(io_worker->get_prov_buf(prov_buf_id), cqe.res), err);
+    parser.put(boost::asio::buffer(io_worker->get_io_uring().get_prov_buf(prov_buf_id), cqe.res), err);
 
     // 由于parser内部会拷贝buffer内容，所以这里可以将占用的prov_buf进行回收
-    io_worker->retrive_prov_buf(prov_buf_id);
+    io_worker->get_io_uring().retrive_prov_buf(prov_buf_id);
 
     if (err)
     {
@@ -118,7 +118,7 @@ bool socket_recv_awaitable::await_resume()
   {
     Log::debug("recv failed for lack of provide buffer");
     // 扩展内存(如果未到上限)
-    io_worker->try_extend_prov_buf();
+    io_worker->get_io_uring().try_extend_prov_buf();
     assert(!(cqe.flags & IORING_CQE_F_MORE));
     // 重试
     return false;
@@ -154,8 +154,8 @@ void socket_send_awaitable::await_suspend(ConnectionTaskHandler h)
 {
   handler = h;
   io_worker = h.promise().io_worker;
-  submit_success = io_worker->send_to_client(sock_fd_idx, serialized_buffers,
-                                             buf_infos, h, used_write_buf);
+  submit_success = io_worker->get_io_uring().send_to_client(sock_fd_idx, serialized_buffers, buf_infos,
+                                                            used_write_buf, h.promise().send_sqe_complete);
 
   // 将本协程放入io_queue
   // 等待后续resume()后，由协程再次co_await该对象
@@ -211,7 +211,7 @@ bool socket_send_awaitable::await_resume()
   for (auto &buf_info : buf_infos)
   {
     if (buf_info.buf_id != -1)
-      io_worker->retrive_write_buf(buf_info.buf_id);
+      io_worker->get_io_uring().retrive_write_buf(buf_info.buf_id);
     else
       delete (char *)const_cast<void *>(buf_info.buf);
   }
@@ -231,7 +231,7 @@ void socket_close_awaitable::await_suspend(ConnectionTaskHandler h)
 
   // 关闭连接
   Worker *io_worker = promise.io_worker;
-  submit_success = io_worker->disconnect(sock_fd_idx, h);
+  submit_success = io_worker->get_io_uring().disconnect(sock_fd_idx);
   // FORCE_ASSERT(submit_success);
 
   if (!submit_success)
@@ -317,7 +317,7 @@ void file_open_awaitable::await_suspend(ConnectionTaskHandler h)
   handler = h;
   io_worker = h.promise().io_worker;
 
-  submit_success = io_worker->open_file_direct(sock_fd_idx, path, mode);
+  submit_success = io_worker->get_io_uring().open_file_direct(sock_fd_idx, path, mode);
   // FORCE_ASSERT(submit_success);
 
   if (!submit_success)
@@ -366,7 +366,7 @@ void file_close_awaitable::await_suspend(ConnectionTaskHandler h)
 
   h.promise().current_io = CLOSE_FILE;
 
-  submit_success = io_worker->close_direct_file(sock_fd_idx, file_fd_idx);
+  submit_success = io_worker->get_io_uring().close_direct_file(sock_fd_idx, file_fd_idx);
   // FORCE_ASSERT(submit_success);
   if (!submit_success)
   {
@@ -411,8 +411,8 @@ void file_read_awaitable::await_suspend(ConnectionTaskHandler h)
   handler = h;
   h.promise().current_io = IOType::READ_FILE;
   // 读取文件
-  submit_success = io_worker->read_file(sock_fd_idx, read_file_fd_idx, file_size,
-                                        used_buffer_id, buf, fixed_file);
+  submit_success = io_worker->get_io_uring().read_file(sock_fd_idx, read_file_fd_idx, file_size,
+                                                       used_buffer_id, buf, fixed_file);
   // FORCE_ASSERT(submit_success);
 
   if (!submit_success)
@@ -443,7 +443,7 @@ bool file_read_awaitable::await_resume()
     if (*used_buffer_id == -1)
       delete (char *)*buf;
     else
-      io_worker->retrive_prov_buf(*used_buffer_id);
+      io_worker->get_io_uring().retrive_prov_buf(*used_buffer_id);
     *read_success = false;
     return true;
   }
@@ -471,8 +471,8 @@ void file_send_awaitable::await_suspend(ConnectionTaskHandler h)
     is_pipe_init = true;
   }
 
-  submit_success = io_worker->sendfile(sock_fd_idx, read_file_fd_idx, file_size,
-                                       h.promise().sendfile_sqe_complete, pipefd, fixed_file);
+  submit_success = io_worker->get_io_uring().sendfile(sock_fd_idx, read_file_fd_idx, file_size,
+                                                      h.promise().sendfile_sqe_complete, pipefd, fixed_file);
   // FORCE_ASSERT(submit_success);
 
   // entires不足，将协程放回队列

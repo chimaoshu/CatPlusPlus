@@ -15,7 +15,7 @@ ADD_EXECUTABLE(log_test src/log.cpp test/log_test.cpp)
 TARGET_LINK_LIBRARIES(log_test uring pthread)
 
 # echo_server
-ADD_EXECUTABLE(echo_server src/log.cpp src/worker.cpp src/http.cpp src/awaitable.cpp examples/http_echo_server.cpp)
+ADD_EXECUTABLE(echo_server src/log.cpp src/worker.cpp src/http.cpp src/awaitable.cpp src/io_uring_wrapper.cpp examples/http_echo_server.cpp)
 TARGET_LINK_LIBRARIES(echo_server uring pthread)
 if (CMAKE_BUILD_TYPE AND (CMAKE_BUILD_TYPE STREQUAL "Release"))
     TARGET_COMPILE_OPTIONS(echo_server PRIVATE -fcoroutines -O3 -DPRODUCTION)
@@ -24,7 +24,7 @@ else()
 endif()
 
 # web_server
-ADD_EXECUTABLE(web_server src/log.cpp src/worker.cpp src/http.cpp src/awaitable.cpp examples/http_web_server.cpp)
+ADD_EXECUTABLE(web_server src/log.cpp src/worker.cpp src/http.cpp src/awaitable.cpp src/io_uring_wrapper.cpp examples/http_web_server.cpp)
 TARGET_LINK_LIBRARIES(web_server uring pthread)
 if (CMAKE_BUILD_TYPE AND (CMAKE_BUILD_TYPE STREQUAL "Release"))
     TARGET_COMPILE_OPTIONS(web_server PRIVATE -fcoroutines -O3 -DPRODUCTION)
@@ -33,7 +33,7 @@ else()
 endif()
 
 # io_test_server
-ADD_EXECUTABLE(io_test_server src/log.cpp src/worker.cpp src/http.cpp src/awaitable.cpp examples/io_test_server.cpp)
+ADD_EXECUTABLE(io_test_server src/log.cpp src/worker.cpp src/http.cpp src/awaitable.cpp src/io_uring_wrapper.cpp examples/io_test_server.cpp)
 TARGET_LINK_LIBRARIES(io_test_server uring pthread)
 if (CMAKE_BUILD_TYPE AND (CMAKE_BUILD_TYPE STREQUAL "Release"))
     TARGET_COMPILE_OPTIONS(io_test_server PRIVATE -fcoroutines -O3 -DPRODUCTION)
