@@ -189,9 +189,10 @@ void Worker::run()
         // 例如connection reset，然后这边close之后，再收到之前还没发完的send请求
         if (current_io != io_type)
         {
-          Log::warn("skip sqe process, sock_fd_idx=", info.fd,
-                    "|current_io=", current_io,
-                    "|cqe_io_type=", io_type);
+          Log::error("skip sqe process, sock_fd_idx=", info.fd,
+                     "|current_io=", current_io,
+                     "|cqe_io_type=", io_type);
+          UtilError::error_exit("receive unknown cqe", false);
           continue;
         }
       }
@@ -206,12 +207,12 @@ void Worker::run()
       }
       case IOType::SEND_SOCKET:
       {
-        // need resume或出错都要resume
-        bool resume = false;
+        std::map<int, bool> &send_sqe_complete = connections_.at(info.fd).handler.promise().send_sqe_complete;
         // 出错
         if (cqe->res < 0)
         {
-          resume = true;
+          // 设置recv_id的complete=true
+          send_sqe_complete.at(info.req_id) = true;
         }
         // 没出错
         else
@@ -220,7 +221,6 @@ void Worker::run()
           // 此时还不能恢复，需要等待收到下一个cqe通知才可以resume
           if (cqe->flags & IORING_CQE_F_MORE)
           {
-            resume = false;
             Log::debug(
                 "recv cqe, IORING_CQE_F_MORE is set, do not resume, "
                 "wait for notification cqe, sock_fd_idx=",
@@ -233,23 +233,22 @@ void Worker::run()
             Log::debug("get notification cqe of zero copy send, sock_fd_idx=",
                        info.fd, "|req_id=", info.req_id);
             // 设置recv_id的complete=true
-            auto &send_sqe_complete = connections_.at(info.fd).handler.promise().send_sqe_complete;
             send_sqe_complete.at(info.req_id) = true;
-
-            resume = true;
-            // 检查是否全部SQE对应的CQE都结束了
-            for (auto it : send_sqe_complete)
-            {
-              if (!it.second)
-              {
-                resume = false;
-                break;
-              }
-            }
           }
         }
 
-        // 需要resume
+        // 检查是否全部SQE对应的CQE都结束了
+        bool resume = true;
+        for (auto it : send_sqe_complete)
+        {
+          if (!it.second)
+          {
+            resume = false;
+            break;
+          }
+        }
+
+        // 需要resume1
         if (resume)
         {
           ConnectionTaskHandler handler = connections_.at(info.fd).handler;
@@ -267,29 +266,30 @@ void Worker::run()
       case IOType::SEND_FILE:
       {
         ConnectionTaskHandler handler = connections_.at(info.fd).handler;
-        bool resume = false;
+        std::map<int, bool> &sendfile_sqe_complete = handler.promise().sendfile_sqe_complete;
+
         // 成功，只有当全部sqe完成时再resume
         if (cqe->res > 0)
         {
-          std::map<int, bool> &sendfile_sqe_complete = handler.promise().sendfile_sqe_complete;
           sendfile_sqe_complete[info.req_id] = true;
           // 检查是否全部cqe都已经收到
-          resume = true;
-          for (auto &it : sendfile_sqe_complete)
-          {
-            if (!it.second)
-            {
-              resume = false;
-              break;
-            }
-          }
         }
-        // 出错直接resume
+        // 出错
         else
         {
+          sendfile_sqe_complete[info.req_id] = true;
           Log::error("senfile failed, need resume, sock_fd_idx=", info.fd,
                      "|cqe->res=", cqe->res, "|req_id=", info.req_id);
-          resume = true;
+        }
+
+        bool resume = true;
+        for (auto &it : sendfile_sqe_complete)
+        {
+          if (!it.second)
+          {
+            resume = false;
+            break;
+          }
         }
 
         if (resume)
