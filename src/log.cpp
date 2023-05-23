@@ -236,6 +236,9 @@ Logger::Logger(const std::string &log_dir,
   if (!(params.features & IORING_FEAT_FAST_POLL))
     UtilError::error_exit(
         "IORING_FEAT_FAST_POLL not supported in current kernel", false);
+  if (!(params.features & IORING_FEAT_SUBMIT_STABLE))
+    UtilError::error_exit(
+        "IORING_FEAT_SUBMIT_STABLE not supported in current kernel", false);
 
   // 注册register file
   std::vector<int> fd_list(log_files.size(), -1);

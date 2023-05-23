@@ -60,10 +60,7 @@ Worker::Worker(int worker_id, ProcessFuncType processor, Service *service)
   {
     int optval = 1;
 
-    bool enable_nodelay = config::force_get_int("TCP_NODELAY");
     int flags = SO_REUSEPORT | SO_REUSEADDR;
-    if (enable_nodelay)
-      flags |= TCP_NODELAY;
     if (setsockopt(listen_fd_, SOL_SOCKET, flags, &optval, sizeof(optval)) < 0)
       UtilError::error_exit("setsockopt failed", true);
 
@@ -167,13 +164,12 @@ void Worker::run()
     {
       count++;
 
-      // IO请求数据
+      // 处理cqe的user_data
       struct IORequestInfo info;
       memcpy(&info, &cqe->user_data, sizeof(struct IORequestInfo));
+      Log::debug("receive cqe, sock_fd_idx=", info.fd, "|type|cqe.res|", (int)info.type, "|", cqe->res);
 
-      Log::debug("receive cqe, sock_fd_idx=", info.fd, "|type|cqe.res|",
-                 (int)info.type, "|", cqe->res);
-
+      // 保护性代码：判断CQE正确性
       IOType io_type = info.type;
       if (io_type != ACCEPT)
       {
@@ -205,63 +201,74 @@ void Worker::run()
         handle_accept(cqe);
         break;
       }
-      case IOType::SEND_SOCKET:
+      // multiple send需要多个sqe完成才能恢复
+      case IOType::MULTIPLE_SEND_ZC_SOCKET:
+      case IOType::MULTIPLE_SEND_SOCKET:
       {
-        std::map<int, bool> &send_sqe_complete = connections_.at(info.fd).handler.promise().send_sqe_complete;
-        // 出错
-        if (cqe->res < 0)
+        // 取出req_id对应的cqe信息
+        ConnectionTaskHandler handler = connections_.at(info.fd).handler;
+        cqe_status &target_cqe = handler.promise().multiple_send_cqes[info.req_id];
+
+        // zero-copy的第一个cqe，只拷贝cqe数据，不标记为已接收
+        if (io_type == MULTIPLE_SEND_ZC_SOCKET && cqe->flags & IORING_CQE_F_MORE)
         {
-          // 设置recv_id的complete=true
-          send_sqe_complete.at(info.req_id) = true;
+          copy_cqe(target_cqe.cqe, *cqe);
+          Log::debug("recv cqe, IORING_CQE_F_MORE is set, do not resume, wait for notification cqe, sock_fd_idx=", info.fd);
+          assert(!target_cqe.has_recv);
         }
-        // 没出错
-        else
+        // zero-copy的第二个cqe，标记为已接收
+        else if (io_type == MULTIPLE_SEND_ZC_SOCKET && cqe->flags & IORING_CQE_F_NOTIF)
         {
-          // 接收到sendzc的第一个cqe，IORING_CQE_F_MORE表示还会有一个cqe通知表示结束
-          // 此时还不能恢复，需要等待收到下一个cqe通知才可以resume
-          if (cqe->flags & IORING_CQE_F_MORE)
-          {
-            Log::debug(
-                "recv cqe, IORING_CQE_F_MORE is set, do not resume, "
-                "wait for notification cqe, sock_fd_idx=",
-                info.fd, "|req_id=", info.req_id);
-          }
-          // 通知请求
-          // else if (cqe->flags & IORING_CQE_F_NOTIF)
-          else
-          {
-            Log::debug("get notification cqe of zero copy send, sock_fd_idx=",
-                       info.fd, "|req_id=", info.req_id);
-            // 设置recv_id的complete=true
-            send_sqe_complete.at(info.req_id) = true;
-          }
+          target_cqe.has_recv = true;
+          Log::debug("recv cqe, IORING_CQE_F_NOTIF is set|sock_fd_idx=", info.fd);
+        }
+        // 非zero-copy的一个sqe只对应一个cqe，同时拷贝与标记
+        else if (io_type == MULTIPLE_SEND_SOCKET)
+        {
+          copy_cqe(target_cqe.cqe, *cqe);
+          target_cqe.has_recv = true;
         }
 
-        // 检查是否全部SQE对应的CQE都结束了
-        bool resume = true;
-        for (auto it : send_sqe_complete)
+        // 判断是否全部cqe都处理完毕，可以恢复协程
+        bool recv_all = true;
+        for (const cqe_status &cqe : handler.promise().multiple_send_cqes)
         {
-          if (!it.second)
+          if (!cqe.has_recv)
           {
-            resume = false;
+            recv_all = false;
             break;
           }
         }
-
-        // 需要resume1
-        if (resume)
+        if (recv_all)
+        {
+          Log::debug("all cqe received, preapre to resume coroutine|sock_fd_idx=", info.fd);
+          handler.resume();
+        }
+        break;
+      }
+      // zero copy的send都有相同行为：需要两个cqe才能恢复
+      case IOType::SENDMSG_ZC_SOCKET:
+      {
+        // 接收到sendzc的第一个cqe，IORING_CQE_F_MORE表示还会有一个cqe通知表示结束
+        // 此时还不能恢复，需要等待收到下一个cqe通知才可以resume
+        // 但此时的cqe.res是代表IO结果的，因此在这里拷贝
+        if (cqe->flags & IORING_CQE_F_MORE)
         {
           ConnectionTaskHandler handler = connections_.at(info.fd).handler;
           copy_cqe(handler.promise().cqe, *cqe);
-          Log::debug("process send cqe, need to resume, cqe->res=", cqe->res);
-          handler.resume();
+          Log::debug("recv cqe, IORING_CQE_F_MORE is set, do not resume, wait for notification cqe, sock_fd_idx=", info.fd);
+          break;
         }
+        // 第二个cqe进行resume
         else
         {
-          Log::debug("process send cqe and not need to resume, sock_fd_idx=",
-                     info.fd, "|req_id=", info.req_id);
+          ConnectionTaskHandler handler = connections_.at(info.fd).handler;
+          // 此处不能copy
+          // copy_cqe(handler.promise().cqe, *cqe);
+          Log::debug("process send cqe, need to resume, cqe->res=", cqe->res);
+          handler.resume();
+          break;
         }
-        break;
       }
       case IOType::SEND_FILE:
       {
@@ -279,7 +286,8 @@ void Worker::run()
         {
           sendfile_sqe_complete[info.req_id] = true;
           Log::error("senfile failed, need resume, sock_fd_idx=", info.fd,
-                     "|cqe->res=", cqe->res, "|req_id=", info.req_id);
+                     "|cqe->res=", cqe->res,
+                     "|req_id=", info.req_id);
         }
 
         bool resume = true;
@@ -306,6 +314,7 @@ void Worker::run()
       }
       case IOType::RECV_SOCKET:
       case IOType::CLOSE_SOCKET:
+      case IOType::SENDMSG_SOCKET:
       case IOType::READ_FILE:
       case IOType::OPEN_FILE:
       case IOType::CLOSE_FILE:
@@ -391,6 +400,14 @@ void Worker::handle_accept(const struct io_uring_cqe *cqe)
           "accept a unclosed socket, this should not happen, sock_fd_idx=" +
               std::to_string(sock_fd_idx),
           false);
+    }
+
+    // 设置tcp_nodelay
+    if (!config::force_get_int("USE_DIRECT_FILE") && config::force_get_int("TCP_NODELAY"))
+    {
+      int flag = 1;
+      if (setsockopt(sock_fd_idx, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) != 0)
+        UtilError::error_exit("set tcp nodelay failed", true);
     }
 
     // 创建协程、添加连接

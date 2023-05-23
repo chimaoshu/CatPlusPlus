@@ -23,7 +23,10 @@ enum IOType : uint8_t
 {
   ACCEPT,
   RECV_SOCKET,
-  SEND_SOCKET,
+  MULTIPLE_SEND_SOCKET,
+  MULTIPLE_SEND_ZC_SOCKET,
+  SENDMSG_SOCKET,
+  SENDMSG_ZC_SOCKET,
   CLOSE_SOCKET,
   SHUTDOWN,
   NONE,
@@ -44,9 +47,11 @@ struct IORequestInfo
 
 struct send_buf_info
 {
-  int buf_id;
-  const void *buf;
-  int len;
+  // buffer在写缓冲池中的id，-1表示临时创建，不属于缓冲池
+  int buf_id = -1;
+  const void *buf = NULL;
+  int len = 0;
+  send_buf_info() = default;
   send_buf_info(int buf_id, const void *buf, int len) : buf_id(buf_id), buf(buf), len(len) {}
 };
 
@@ -84,15 +89,10 @@ public:
   // 添加prov_buf
   bool try_extend_prov_buf();
   // 获取buf
-  void *get_write_buf(int buf_id);
+  void *get_write_buf_by_id(int buf_id);
   void *get_prov_buf(int buf_id);
-
-  // 将序列化后的buffer发送给客户端, 返回是否成功
-  bool send_to_client(int sock_fd_idx,
-                      std::list<boost::asio::const_buffer> &serialized_buffers,
-                      std::list<struct send_buf_info> &buf_infos, 
-                      const std::map<const void *, int> &used_write_buf,
-                      std::map<int, bool> &send_sqe_complete);
+  // 获取或创建
+  send_buf_info get_write_buf_or_create();
 
   // 提交multishot_accept请求
   void add_multishot_accept(int listen_fd);
@@ -102,11 +102,9 @@ public:
   // 关闭连接（提交close请求）
   bool disconnect(int sock_fd_idx);
   // 提交read请求
-  void add_read(int sock_fd_idx, int read_file_fd_idx, int file_size,
-                void **buf, int buf_idx, bool fixed);
+  void add_read(int sock_fd_idx, int read_file_fd_idx, const send_buf_info &read_buf);
   // 读取文件
-  bool read_file(int sock_fd_idx, int read_file_fd_idx, int file_size,
-                 int *used_buffer_id, void **buf, bool fixed);
+  bool read_file(int sock_fd_idx, int read_file_fd_idx, int file_size, send_buf_info &read_buf);
   // 打开文件
   bool open_file_direct(int sock_fd_idx, const std::string &path, mode_t mode);
   // 关闭文件
@@ -116,7 +114,10 @@ public:
                 std::map<int, bool> &sendfile_sqe_complete, int *pipefd,
                 bool fixed_file);
 
-  void add_zero_copy_send(int sock_fd_idx, std::map<int, bool> &send_sqe_complete, const std::list<send_buf_info> &buf_infos);
+  // 一次性提交多个send
+  bool multiple_send(int sock_fd_idx, const std::list<send_buf_info> &buf_infos, bool zero_copy);
+  bool add_zero_copy_send(int sock_fd_idx, const send_buf_info &info, int req_id, bool zero_copy, bool submit);
+  bool add_zero_copy_sendmsg(int sock_fd_idx, const std::list<send_buf_info> &infos, iovec *sendmsg_iov, bool zero_copy);
 
   // get
   struct io_uring *get_struct() { return &ring; }

@@ -50,60 +50,111 @@ bool IOUringWrapper::add_recv(int sock_fd_idx, bool poll_first)
 
 // 提交send_zc请求
 // 调用处检查sqe是否足够
-void IOUringWrapper::add_zero_copy_send(int sock_fd_idx, std::map<int, bool> &send_sqe_complete,
-                                        const std::list<send_buf_info> &buf_infos)
+bool IOUringWrapper::add_zero_copy_send(int sock_fd_idx, const send_buf_info &info, int req_id, bool zero_copy, bool submit)
 {
-  // 循环准备SQE，使用IOSQE_IO_LINK串联起来
-  int req_id = 0;
-  send_sqe_complete.clear();
-  Log::debug("clear send_sqe_complete, prepare to insert, sock_fd_idx=", sock_fd_idx);
-  FORCE_ASSERT(buf_infos.size() > 0);
-  for (auto &buf_info : buf_infos)
+  struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+  if (sqe == NULL)
+    return false;
+
+  // buffer来自write buffer pool
+  if (zero_copy && info.buf_id != -1)
   {
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-    FORCE_ASSERT(sqe != NULL);
-    Log::debug("add zero copy send, sock_fd_idx=", sock_fd_idx,
-               "|write_buf_id=", buf_info.buf_id);
-
-    // 填充sqe
-    if (buf_info.buf_id != -1)
-    {
-      assert(write_buffer_pool_[buf_info.buf_id] == buf_info.buf);
-      io_uring_prep_send_zc_fixed(sqe, sock_fd_idx, buf_info.buf, buf_info.len,
-                                  MSG_WAITALL, 0, buf_info.buf_id);
-    }
-    else
-    {
-      io_uring_prep_send_zc(sqe, sock_fd_idx, buf_info.buf, buf_info.len,
-                            MSG_WAITALL, 0);
-    }
-
-    static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
-    if (use_direct_file)
-      sqe->flags |= IOSQE_FIXED_FILE;
-
-    // 长度大于1则需要链接，以保证先后顺序，最后一个不设置，表示链接结束
-    // 设置也无所谓，因为IO_SQE_LINK的影响不会跨越submit
-    if (buf_infos.size() > 1 && buf_info.buf_id != buf_infos.back().buf_id)
-      sqe->flags |= IOSQE_IO_LINK;
-
-    // 后续用于判断是否各SQE都完成了，才能恢复协程
-    send_sqe_complete[req_id] = false;
-    Log::debug("add send_sqe_complete req_id, sock_fd_idx=", sock_fd_idx,
-               "|req_id=", req_id);
-
-    // user data
-    IORequestInfo req_info{.fd = sock_fd_idx,
-                           .req_id = static_cast<int16_t>(req_id),
-                           .type = SEND_SOCKET};
-    memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
-    req_id++;
+    assert(write_buffer_pool_[info.buf_id] == info.buf);
+    // 使用IO_LINK时需要加上MSG_WAITALL
+    io_uring_prep_send_zc_fixed(sqe, sock_fd_idx, info.buf, info.len, MSG_WAITALL, 0, info.buf_id);
+  }
+  // buffer不来自write buffer pool
+  else if (zero_copy && info.buf_id == -1)
+  {
+    // 使用IO_LINK时需要加上MSG_WAITALL
+    io_uring_prep_send_zc(sqe, sock_fd_idx, info.buf, info.len, MSG_WAITALL, 0);
+  }
+  // 非zero copy
+  else if (!zero_copy)
+  {
+    io_uring_prep_send(sqe, sock_fd_idx, info.buf, info.len, MSG_WAITALL);
   }
 
+  sqe->flags |= IOSQE_IO_LINK;
+
+  static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
+  if (use_direct_file)
+    sqe->flags |= IOSQE_FIXED_FILE;
+
+  Log::debug("add zero copy send, sock_fd_idx=", sock_fd_idx,
+             "|write_buf_id=", info.buf_id);
+
+  // user data
+  IORequestInfo req_info{.fd = sock_fd_idx, .req_id = static_cast<int16_t>(req_id), .type = zero_copy ? MULTIPLE_SEND_ZC_SOCKET : MULTIPLE_SEND_SOCKET};
+  memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
+
   // 提交
-  Log::debug("add send request, sock_fd_idx=", sock_fd_idx,
-             "|buf_infos.size()=", buf_infos.size());
+  Log::debug("add send request",
+             "|sock_fd_idx=", sock_fd_idx,
+             "|buf_id=", info.buf_id,
+             "|len=", info.len);
+
+  if (submit)
+    io_uring_submit(&ring);
+
+  return true;
+}
+
+bool IOUringWrapper::add_zero_copy_sendmsg(int sock_fd_idx, const std::list<send_buf_info> &infos,
+                                           iovec *sendmsg_iov, bool zero_copy)
+{
+  struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+  if (sqe == NULL)
+    return false;
+
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+
+  struct iovec *iov = new iovec[infos.size()];
+  memset(iov, 0, sizeof(iov));
+
+  int i = 0;
+  for (const send_buf_info &info : infos)
+  {
+    iov[i].iov_base = const_cast<void *>(info.buf);
+    iov[i].iov_len = info.len;
+    i++;
+  }
+
+  msg.msg_iov = iov;
+  msg.msg_iovlen = infos.size();
+
+  if (zero_copy)
+    io_uring_prep_sendmsg_zc(sqe, sock_fd_idx, &msg, 0);
+  else
+    io_uring_prep_sendmsg(sqe, sock_fd_idx, &msg, 0);
+
+  static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
+  if (use_direct_file)
+    sqe->flags |= IOSQE_FIXED_FILE;
+
+  // user data
+  IORequestInfo req_info{.fd = sock_fd_idx, .req_id = 0, .type = zero_copy ? SENDMSG_ZC_SOCKET : SENDMSG_SOCKET};
+  memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
+
+  // 提交
+  Log::debug("add zero copy sendmsg, sock_fd_idx=", sock_fd_idx);
+  if (UtilEnv::is_debug_mode())
+  {
+    std::cout << "size: " << infos.size() << std::endl;
+    for (const send_buf_info &info : infos)
+      std::cout << "buf=" << info.buf << "buf_id=" << info.buf_id << "len=" << info.len << std::endl;
+  }
+
   io_uring_submit(&ring);
+
+  // 5.4以后的内核，提交之后就iov可以删除了：IORING_FEAT_SUBMIT_STABLE
+  // 但是只有当IORING_SETUP_SQPOLL没开启时才可以
+  // 见：https://github.com/axboe/liburing/discussions/676
+
+  // 将iov注册到promise中，在resume时删除。
+  sendmsg_iov = iov;
+  return true;
 }
 
 // 关闭连接（提交close请求）
@@ -182,153 +233,34 @@ bool IOUringWrapper::try_extend_prov_buf()
 }
 
 // 获取buf
-void *IOUringWrapper::get_write_buf(int buf_id) { return write_buffer_pool_[buf_id]; }
+void *IOUringWrapper::get_write_buf_by_id(int buf_id) { return write_buffer_pool_[buf_id]; }
 
 void *IOUringWrapper::get_prov_buf(int buf_id) { return read_buffer_pool_[buf_id]; }
 
-bool IOUringWrapper::send_to_client(
-    int sock_fd_idx, std::list<boost::asio::const_buffer> &serialized_buffers,
-    std::list<struct send_buf_info> &buf_infos,
-    const std::map<const void *, int> &used_write_buf,
-    std::map<int, bool> &send_sqe_complete)
+// 合并多个send请求
+bool IOUringWrapper::multiple_send(int sock_fd_idx, const std::list<send_buf_info> &buf_infos, bool zero_copy)
 {
-  // 计算所需buffer字节数与所需页数
-  int need_page_num = 0, temp_msg_len = 0;
-  for (auto buf : serialized_buffers)
-  {
-    // 通过`co_await file_read`已经写入write_buf的缓存
-    // 前面不足一块buf的以一块buf计算
-    if (used_write_buf.find(buf.data()) != used_write_buf.end())
-    {
-      need_page_num += (temp_msg_len + page_size - 1) / page_size;
-      temp_msg_len = 0;
-      continue;
-    }
-    // 不属于used_buf，则积累temp_msg_len
-    temp_msg_len += buf.size();
-  }
-  need_page_num += (temp_msg_len + page_size - 1) / page_size;
-
   // 检查可用sqe是否足够
-  int available_entries = io_uring_sq_space_left(&ring);
-  if (available_entries < need_page_num + used_write_buf.size())
+  int sqe_num = io_uring_sq_space_left(&ring);
+  if (sqe_num < buf_infos.size())
   {
-    Log::debug("io_uring entries not enough, sock_fd_idx=", sock_fd_idx,
-               "|need entries=", need_page_num + used_write_buf.size(),
-               "|available_entries=", available_entries);
+    Log::debug("io_uring sqe not enough, sock_fd_idx=", sock_fd_idx,
+               "|need sqe=", buf_infos.size(),
+               "|sqe_num=", sqe_num);
     return false;
   }
 
-  // buffer不足，尝试扩展
-  if (unused_write_buffer_id_.size() < need_page_num)
+  // 提交到io_uring，使用IOSQE_IO_LINK串联起来
+  int req_id = 0;
+  for (auto it = buf_infos.begin(); it != buf_infos.end(); it++)
   {
-    // 可以扩展的buffer数量，不能超过max_buffer_num
-    int extend_buf_num =
-        std::min(max_buffer_num_ - write_buffer_pool_.size(),
-                 need_page_num - unused_write_buffer_id_.size());
-    extend_write_buffer_pool(extend_buf_num);
+    const send_buf_info &buf_info = *it;
+    bool submit = (std::next(it) == buf_infos.end());
+    FORCE_ASSERT(add_zero_copy_send(sock_fd_idx, buf_info, req_id, zero_copy, submit));
+    req_id++;
   }
 
-  // buffer不能扩展或者扩展后仍然不足，需要重新co_await调用该对象
-  if (unused_write_buffer_id_.size() < need_page_num)
-    return false;
-
-  // buffer足够，将serializer产生的buffer拷贝到wirte_buffer中
-  else if (unused_write_buffer_id_.size() >= need_page_num)
-  {
-    int dest_start_pos = 0, src_start_pos = 0, buf_id = -1;
-    auto it = serialized_buffers.begin();
-    while (true)
-    {
-      // 需要取下一块serialzed_buffer
-      int src_buf_remain_bytes = it->size() - src_start_pos;
-      assert(src_buf_remain_bytes >= 0);
-      if (src_buf_remain_bytes == 0)
-      {
-        it++;
-        // 若该buffer为write_buf（只出现在body，因此不会在一开始出现）
-        if (used_write_buf.find(it->data()) != used_write_buf.end())
-        {
-          // 强行停止上一块write_buf（即使没有写满也要，但是全空则不动），保存buf和len
-          if (dest_start_pos != 0)
-            buf_infos.emplace_back(buf_id, write_buffer_pool_[buf_id], dest_start_pos);
-          // 当前的write_buf直接进
-          buf_infos.emplace_back(used_write_buf.at(it->data()), it->data(), it->size());
-          // 下一块serialized buf
-          it++;
-          // 看是否结束，有时候如果使用chunked-encoding，就不会结束，后续还要继续发东西
-          if (it == serialized_buffers.end())
-            break;
-          // 更新src信息
-          src_start_pos = 0;
-
-          // 取下一块write_buf
-          buf_id = unused_write_buffer_id_.front();
-          unused_write_buffer_id_.pop();
-          // 更新dest信息
-          dest_start_pos = 0;
-
-          // 进入下一轮拷贝
-          continue;
-        }
-
-        // 若已全部拷贝则退出循环
-        if (it == serialized_buffers.end())
-        {
-          // 最后一块write_buffer，如果没用过则回收回去
-          if (dest_start_pos == 0)
-          {
-            Log::debug("dest_start_pos=0, retrive write buf_id=", buf_id);
-            retrive_write_buf(buf_id);
-          }
-          // 用过，则写入最后一块write_buf，保存buf和len
-          else
-          {
-            buf_infos.emplace_back(buf_id, write_buffer_pool_[buf_id], dest_start_pos);
-          }
-          break;
-        }
-        // 更新remain bytes
-        src_buf_remain_bytes = it->size();
-        src_start_pos = 0;
-      }
-
-      // 需要取下一块write buffer
-      int dest_buf_remain_bytes = page_size - dest_start_pos;
-      assert(dest_buf_remain_bytes >= 0);
-
-      if (buf_id == -1 || dest_buf_remain_bytes == 0)
-      {
-        // 写完完整的一页buffer，保存buf和len
-        if (dest_buf_remain_bytes == 0)
-          buf_infos.emplace_back(buf_id, write_buffer_pool_[buf_id], page_size);
-        buf_id = unused_write_buffer_id_.front();
-        unused_write_buffer_id_.pop();
-        dest_buf_remain_bytes = page_size;
-        dest_start_pos = 0;
-        Log::debug("use write buffer id=", buf_id);
-      }
-
-      // 需要拷贝的字节数
-      int bytes_to_copy = std::min(src_buf_remain_bytes, dest_buf_remain_bytes);
-
-      // 进行拷贝
-      memcpy((char *)write_buffer_pool_[buf_id] + dest_start_pos,
-             (char *)it->data() + src_start_pos, bytes_to_copy);
-      dest_start_pos += bytes_to_copy;
-      src_start_pos += bytes_to_copy;
-    }
-
-    assert(buf_infos.size() == need_page_num + used_write_buf.size());
-
-    // 提交到io_uring，使用IOSQE_IO_LINK串联起来
-    add_zero_copy_send(sock_fd_idx, send_sqe_complete, buf_infos);
-    return true;
-  }
-
-  // 不会到达这里
-  assert(false);
-  return false;
+  return true;
 }
 
 IOUringWrapper::IOUringWrapper()
@@ -352,11 +284,9 @@ IOUringWrapper::IOUringWrapper()
     if (ret < 0)
       UtilError::error_exit("io_uring setup failed, ret=" + std::to_string(ret), false);
     if (!(params.features & IORING_FEAT_FAST_POLL))
-      UtilError::error_exit(
-          "IORING_FEAT_FAST_POLL not supported in current kernel", false);
+      UtilError::error_exit("IORING_FEAT_FAST_POLL not supported in current kernel", false);
     if (!(params.features & IORING_FEAT_SUBMIT_STABLE))
-      UtilError::error_exit(
-          "IORING_FEAT_SUBMIT_STABLE not supported in current kernel", false);
+      UtilError::error_exit("IORING_FEAT_SUBMIT_STABLE not supported in current kernel", false);
     // TODO: check io_uring op code suport
   }
 
@@ -429,26 +359,24 @@ IOUringWrapper::IOUringWrapper()
 
 // 提交read请求
 // 调用端保证sqe可用
-void IOUringWrapper::add_read(int sock_fd_idx, int read_file_fd_idx, int file_size,
-                              void **buf, int buf_idx, bool fixed_file)
+void IOUringWrapper::add_read(int sock_fd_idx, int read_file_fd_idx, const send_buf_info &read_buf)
 {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
   FORCE_ASSERT(sqe != NULL);
 
   // 使用fixed buffer
-  if (buf_idx != -1)
+  if (read_buf.buf_id != -1)
   {
-    assert(write_buffer_pool_[buf_idx] == *buf);
-    io_uring_prep_read_fixed(sqe, read_file_fd_idx, *buf, file_size, 0, buf_idx);
+    assert(write_buffer_pool_[read_buf.buf_id] == read_buf.buf);
+    io_uring_prep_read_fixed(sqe, read_file_fd_idx, const_cast<void *>(read_buf.buf), read_buf.len, 0, read_buf.buf_id);
   }
   // 使用temp buffer
   else
   {
-    io_uring_prep_read(sqe, read_file_fd_idx, *buf, file_size, 0);
+    io_uring_prep_read(sqe, read_file_fd_idx, const_cast<void *>(read_buf.buf), read_buf.len, 0);
   }
 
-  // TODO：重构使用USE_DIRECT_FILE
-  if (fixed_file)
+  if (config::force_get_int("USE_DIRECT_FILE"))
     sqe->flags |= IOSQE_FIXED_FILE;
 
   // user data
@@ -475,8 +403,8 @@ bool IOUringWrapper::open_file_direct(int sock_fd_idx, const std::string &path,
 }
 
 // 读取文件
-bool IOUringWrapper::read_file(int sock_fd_idx, int read_file_fd_idx, int file_size,
-                               int *used_buffer_id, void **buf, bool fixed_file)
+// 优先使用写缓冲池中的buffer（当文件大小小于一页且有可用的缓冲区时）
+bool IOUringWrapper::read_file(int sock_fd_idx, int read_file_fd_idx, int file_size, send_buf_info &read_buf)
 {
   if (io_uring_sq_space_left(&ring) < 1)
   {
@@ -484,26 +412,21 @@ bool IOUringWrapper::read_file(int sock_fd_idx, int read_file_fd_idx, int file_s
     return false;
   }
 
-  // write_buf可用，且page_num为1，使用write_buf，作为fixed_buffer可以加速
-  // io_uring 不支持 readv with fixed buffer
-  // 因此只在一块buffer能覆盖的情况下，使用fixed buffer
-  // 使用write_buffer_pool是为了后续直接发送给客户端
+  // 当文件大小小于一页且有可用的缓冲区时，使用缓冲池中的buffer
   int page_num = (file_size + page_size - 1) / page_size;
   if (page_num == 1 && unused_write_buffer_id_.size() > 0)
   {
     // get buf
-    *used_buffer_id = unused_write_buffer_id_.front();
+    int buf_id = unused_write_buffer_id_.front();
     unused_write_buffer_id_.pop();
-    *buf = write_buffer_pool_[*used_buffer_id];
-    add_read(sock_fd_idx, read_file_fd_idx, file_size, buf, *used_buffer_id, fixed_file);
+    read_buf = send_buf_info{buf_id, write_buffer_pool_[buf_id], file_size};
+    add_read(sock_fd_idx, read_file_fd_idx, read_buf);
   }
-  // write_buf不够，直接开辟内存
+  // 无法使用缓冲池中的buffer，直接开辟内存
   else
   {
-    *used_buffer_id = -1;
-    *buf = new char[file_size];
-    // -1表示不使用fixed buffer，而使用temp buffer
-    add_read(sock_fd_idx, read_file_fd_idx, file_size, buf, -1, fixed_file);
+    read_buf = send_buf_info{-1, new char[file_size], file_size};
+    add_read(sock_fd_idx, read_file_fd_idx, read_buf);
   }
   return true;
 }
@@ -646,4 +569,27 @@ bool IOUringWrapper::close_direct_file(int sock_fd_idx, int file_fd_idx)
 
   io_uring_submit(&ring);
   return true;
+}
+
+send_buf_info IOUringWrapper::get_write_buf_or_create()
+{
+  send_buf_info buf_info;
+  // 缓冲区无可拥，则new一块
+  if (unused_write_buffer_id_.size() == 0)
+  {
+    buf_info.buf = new char[page_size];
+    buf_info.buf_id = -1;
+    buf_info.len = page_size;
+  }
+  // 缓冲区可拥，则获取一块
+  else
+  {
+    int buf_id = unused_write_buffer_id_.front();
+    unused_write_buffer_id_.pop();
+
+    buf_info.buf = write_buffer_pool_[buf_id];
+    buf_info.buf_id = buf_id;
+    buf_info.len = page_size;
+  }
+  return buf_info;
 }

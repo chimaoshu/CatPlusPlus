@@ -16,6 +16,32 @@
 #include <sstream>
 #include <string>
 
+namespace UtilEnv
+{
+  enum Mode
+  {
+    PROD,
+    DEBUG
+  };
+
+#ifdef PRODUCTION
+  constexpr Mode BuildMode = Mode::PROD;
+#else
+  constexpr Mode BuildMode = Mode::DEBUG;
+#endif
+
+  static bool is_debug_mode()
+  {
+    return BuildMode == Mode::DEBUG;
+  }
+
+  static bool is_production_mode()
+  {
+    return BuildMode == Mode::PROD;
+  }
+
+} // namespace UtilEnv
+
 namespace UtilFile
 {
   static bool dir_exists(const std::string &path)

@@ -38,6 +38,12 @@ struct coroutine_cqe
   __u32 flags;
 };
 
+struct cqe_status
+{
+  coroutine_cqe cqe;
+  bool has_recv = false;
+};
+
 class Worker;
 struct ConnectionTask
 {
@@ -60,10 +66,11 @@ public:
     // 当前正在进行的IO
     IOType current_io = IOType::NONE;
 
-    // 进行RECV操作时，记录多个SQE的完成与否，全部完成后才可以恢复协程
-    std::map<int, bool> send_sqe_complete;
     // 进行SEND_FILE操作时，记录多个SQE的完成与否，全部完成后才可以恢复协程
     std::map<int, bool> sendfile_sqe_complete;
+    std::vector<cqe_status> multiple_send_cqes;
+    // sendmsg使用到的iovec
+    struct iovec *sendmsg_iov = NULL;
 
   public:
     // 协程在开始执行之前会调用该方法，返回协程句柄
@@ -164,6 +171,7 @@ private:
   friend struct file_open_awaitable;
   friend struct file_close_awaitable;
   friend struct file_send_awaitable;
+  friend struct serialize_awaitable;
 
 public:
   // 提交send_zc请求
