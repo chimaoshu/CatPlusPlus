@@ -18,7 +18,7 @@
     auto startTime = std::chrono::steady_clock::now();                                                  \
     func auto endTime = std::chrono::steady_clock::now();                                               \
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count(); \
-    std::cout << tag << "(ms):" << duration << '\n';                                                    \
+    std::cout << tag << "(ms):" << duration << std::endl;                                                    \
   }
 
 // 设置套接字
@@ -81,6 +81,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     {
       Log::debug("co_await recv_awaitable with sock_fd_idx=", sock_fd_idx);
       // 此处会提交recv请求并挂起协程，直到recv完成
+      OPEN_SOCKET_FEAT(sock_fd_idx, TCP_QUICKACK);
       finish_read = co_await recv_awaitable;
     }
 
@@ -319,7 +320,8 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     }
 
     // web_server常规模式，若web文件较小，则完全读取到内存中再发送
-    bool large_web_file = (web_server_file_size >= 1048576);
+    // 目前认为>=4M属于大文件
+    bool large_web_file = (web_server_file_size >= 4 * 1048576);
     send_buf_info body_buf_info{.buf_id = -1, .buf = NULL, .len = 0};
     if (args.use_web_server && !use_sendfile_to_transfer_body && !large_web_file)
     {
@@ -361,18 +363,18 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     // 考虑使用sendmsg一次发送
     // for (const send_buf_info &buf_info : send_bufs)
     {
-      OPEN_SOCKET_FEAT(sock_fd_idx, TCP_NODELAY);
+      if (config::force_get_int("TCP_NODELAY"))
+        OPEN_SOCKET_FEAT(sock_fd_idx, TCP_NODELAY);
 
       // 大文件以及后续sendfile的文件
       if (use_sendfile_to_transfer_body && config::force_get_int("TCP_CORK"))
         OPEN_SOCKET_FEAT(sock_fd_idx, TCP_CORK);
 
       // 非大文件时使用zero-copy才有优势
-      bool use_zero_copy = !large_web_file;
+      bool use_zero_copy = !large_web_file && !use_sendfile_to_transfer_body;
       awaitable_result send_result;
       // CALCULATE_DURATION(ASYNC_IO(sock_fd_idx, socket_send(sock_fd_idx, send_bufs, true), send_result), "send")
-      OPEN_SOCKET_FEAT(sock_fd_idx, TCP_QUICKACK);
-      ASYNC_IO(sock_fd_idx, socket_send(sock_fd_idx, send_bufs, use_zero_copy), send_result)
+      CALCULATE_DURATION(ASYNC_IO(sock_fd_idx, socket_send(sock_fd_idx, send_bufs, use_zero_copy), send_result), "send")
 
       // 发送出错，关闭连接并退出协程
       if (send_result.res < 0)
@@ -425,7 +427,6 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
         // 写一页
         awaitable_result send_result;
         // send_result.res = send(sock_fd_idx, buf_info.buf, buf_info.len, 0);
-        OPEN_SOCKET_FEAT(sock_fd_idx, TCP_QUICKACK);
         ASYNC_IO(sock_fd_idx, socket_send(sock_fd_idx, buf_info, false), send_result)
         // ASYNC_IO(sock_fd_idx, socket_send(sock_fd_idx, buf_info, true), send_result)
 
@@ -449,7 +450,8 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       static bool use_async_sendfile = config::force_get_int("USE_ASYNC_SENDFILE");
       if (use_async_sendfile)
       {
-
+        if (config::force_get_int("TCP_NODELAY"))
+          OPEN_SOCKET_FEAT(sock_fd_idx, TCP_NODELAY);
         CALCULATE_DURATION(
             bool finish_sendfile = false;
             auto file_send_awaitable = file_send(sock_fd_idx, web_server_file_fd,
@@ -470,10 +472,21 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
         if (use_direct_file)
           UtilError::error_exit("config error: USE_DIRECT_FILE must be disable if USE_ASYNC_SENDFILE is disable", false);
 
-        int ret = sendfile(sock_fd_idx, web_server_file_fd, NULL, web_server_file_size);
-        sendfile_success = (ret != -1);
-        if (ret == -1)
-          Log::error("sync sendfile failed, sock_fd_idx=", sock_fd_idx, "|ret=", ret, "|file_fd=", web_server_file_fd);
+        off_t offset = 0;
+        int remain_bytes = web_server_file_size;
+        int sendfile_chunked = sysconf(_SC_PAGE_SIZE) * 16;
+        sendfile_success = true;
+        while (remain_bytes > 0)
+        {
+          int ret = sendfile(sock_fd_idx, web_server_file_fd, &offset, sendfile_chunked);
+          if (ret == -1)
+          {
+            sendfile_success = false;
+            Log::error("sync sendfile failed, sock_fd_idx=", sock_fd_idx, "|ret=", ret, "|file_fd=", web_server_file_fd);
+            break;
+          }
+          remain_bytes -= ret;
+        }
       }
 
       // 关闭文件
