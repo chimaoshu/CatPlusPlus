@@ -186,8 +186,8 @@ void Worker::run()
         if (current_io != io_type)
         {
           Log::error("skip sqe process, sock_fd_idx=", info.fd,
-                     "|current_io=", current_io,
-                     "|cqe_io_type=", io_type);
+                     "|current_io=", (int)current_io,
+                     "|cqe_io_type=", (int)io_type);
           UtilError::error_exit("receive unknown cqe", false);
           continue;
         }

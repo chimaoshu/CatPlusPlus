@@ -156,14 +156,6 @@ void socket_send_awaitable::await_suspend(ConnectionTaskHandler h)
   handler = h;
   io_worker = h.promise().io_worker;
 
-  // 设置TCP发送缓冲区的大小，按page_size大小向上取整
-  int send_buf_size = 0, page_size = sysconf(_SC_PAGESIZE);
-  for (const send_buf_info &buf : buf_infos)
-    send_buf_size += buf.len;
-  send_buf_size = (send_buf_size + page_size - 1) / page_size * page_size;
-  if (!config::force_get_int("USE_DIRECT_FILE") && setsockopt(sock_fd_idx, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size)) == -1)
-    Log::error("set send buf failed|sock_fd_idx=", sock_fd_idx, "|buf_size=", send_buf_size);
-
   is_submitted = io_worker->get_io_uring().multiple_send(sock_fd_idx, buf_infos, zero_copy);
 
   // 将本协程放入io_queue

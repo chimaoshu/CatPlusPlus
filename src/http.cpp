@@ -18,7 +18,7 @@
     auto startTime = std::chrono::steady_clock::now();                                                  \
     func auto endTime = std::chrono::steady_clock::now();                                               \
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count(); \
-    std::cout << tag << "(ms):" << duration << std::endl;                                                    \
+    std::cout << tag << "(ms):" << duration << std::endl;                                               \
   }
 
 // 设置套接字
@@ -233,68 +233,6 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       assert(args.use_web_server);
     }
 
-    // // 不使用sendfile模式，而是使用read+send模式
-    // else if (!use_sendfile_to_transfer_body)
-    // {
-    //   void *buf = NULL;
-    //   int used_buf_id = -1;
-    //   bool read_success = false;
-    //   auto awaitable = file_read(sock_fd_idx, web_server_file_fd,
-    //                              web_server_file_size, &buf, &used_buf_id,
-    //                              &read_success, use_direct_file);
-
-    //   // 读取
-    //   bool finish_read = false;
-    //   while (!finish_read)
-    //   {
-    //     Log::debug("co_await file_read, sock_fd_idx=", sock_fd_idx);
-    //     finish_read = co_await awaitable;
-    //   }
-
-    //   // 读取成功
-    //   if (read_success)
-    //   {
-    //     web_file_used_buf[buf] = used_buf_id;
-
-    //     // header
-    //     response_buf.set(http::field::content_type, "text/html");
-    //     response_buf.version(request.version());
-    //     response_buf.result(http::status::ok);
-    //     response_buf.keep_alive(request.keep_alive());
-
-    //     // length
-    //     response_buf.content_length(web_server_file_size);
-
-    //     // body
-    //     response_buf.body().data = buf;
-    //     response_buf.body().size = web_server_file_size;
-    //     response_buf.body().more = false;
-    //     use_buf_body = true;
-    //   }
-    //   // 读取失败
-    //   else if (!read_success)
-    //   {
-    //     Log::error("read file failed, file_path=", args.file_path, "|sock_fd_idx=", sock_fd_idx);
-    //     response.version(request.version());
-    //     response.keep_alive(request.keep_alive());
-    //     response.result(http::status::not_found);
-    //     response.body() = "404 not found";
-    //     use_buf_body = false;
-    //   }
-
-    //   // 关闭文件 direct
-    //   if (use_direct_file)
-    //   {
-    //     bool finish_close = false;
-    //     while (!finish_close)
-    //       finish_close = co_await file_close(sock_fd_idx, web_server_file_fd);
-    //   }
-    //   // 关闭文件 regular
-    //   else
-    //   {
-    //     close(web_server_file_fd);
-    //   }
-
     // 序列化response
     // 常规模式下，序列化header与body
     // 但如果使用web_server，则只序列化header，后续另外处理body
@@ -366,15 +304,10 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       if (config::force_get_int("TCP_NODELAY"))
         OPEN_SOCKET_FEAT(sock_fd_idx, TCP_NODELAY);
 
-      // 大文件以及后续sendfile的文件
-      if (use_sendfile_to_transfer_body && config::force_get_int("TCP_CORK"))
-        OPEN_SOCKET_FEAT(sock_fd_idx, TCP_CORK);
-
       // 非大文件时使用zero-copy才有优势
       bool use_zero_copy = !large_web_file && !use_sendfile_to_transfer_body;
       awaitable_result send_result;
-      // CALCULATE_DURATION(ASYNC_IO(sock_fd_idx, socket_send(sock_fd_idx, send_bufs, true), send_result), "send")
-      CALCULATE_DURATION(ASYNC_IO(sock_fd_idx, socket_send(sock_fd_idx, send_bufs, use_zero_copy), send_result), "send")
+      ASYNC_IO(sock_fd_idx, socket_send(sock_fd_idx, send_bufs, use_zero_copy), send_result)
 
       // 发送出错，关闭连接并退出协程
       if (send_result.res < 0)
@@ -452,17 +385,16 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       {
         if (config::force_get_int("TCP_NODELAY"))
           OPEN_SOCKET_FEAT(sock_fd_idx, TCP_NODELAY);
-        CALCULATE_DURATION(
-            bool finish_sendfile = false;
-            auto file_send_awaitable = file_send(sock_fd_idx, web_server_file_fd,
-                                                 web_server_file_size, &sendfile_success,
-                                                 use_direct_file);
+        bool finish_sendfile = false;
+        auto file_send_awaitable = file_send(sock_fd_idx, web_server_file_fd,
+                                             web_server_file_size, &sendfile_success,
+                                             use_direct_file);
 
-            while (!finish_sendfile) {
-              Log::debug("co_await file_send, sock_fd_idx=", sock_fd_idx);
-              finish_sendfile = co_await file_send_awaitable;
-            },
-            "sendfile")
+        while (!finish_sendfile)
+        {
+          Log::debug("co_await file_send, sock_fd_idx=", sock_fd_idx);
+          finish_sendfile = co_await file_send_awaitable;
+        }
       }
 
       // 使用同步的sendfile，这将阻塞工作线程
@@ -499,9 +431,6 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
         CLOSE_AND_EXIT(sock_fd_idx, close_result)
       }
     }
-
-    if (use_sendfile_to_transfer_body && config::force_get_int("TCP_CORK"))
-      CLOSE_SOCKET_FEAT(sock_fd_idx, TCP_CORK);
 
     // TODO: 考虑加个callback函数，或者PorcessFuncArg里面加个变量
     // 可以销毁buffer body使用的buffer
