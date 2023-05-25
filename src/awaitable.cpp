@@ -227,7 +227,7 @@ void socket_sendmsg_awaitable::await_suspend(ConnectionTaskHandler h)
   for (const send_buf_info &buf : buf_infos)
     send_buf_size += buf.len;
   send_buf_size = (send_buf_size + page_size - 1) / page_size * page_size;
-  if (!config::force_get_int("USE_DIRECT_FILE") && setsockopt(sock_fd_idx, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size)) == -1)
+  if (setsockopt(sock_fd_idx, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size)) == -1)
     Log::error("set send buf failed|sock_fd_idx=", sock_fd_idx, "|buf_size=", send_buf_size);
 
   struct iovec *sendmsg_iov = h.promise().sendmsg_iov;
@@ -318,7 +318,14 @@ awaitable_result socket_close_awaitable::await_resume()
         .res = -EAGAIN};
   }
 
-  promise.io_worker->connections_.erase(sock_fd_idx);
+  Worker *io_worker = promise.io_worker;
+
+  // 删除连接
+  io_worker->connections_.erase(sock_fd_idx);
+
+  // 关闭连接后，若连接小于上限，则继续打开accpet
+  if (!io_worker->is_accpeting() && io_worker->connections_.size() < config::force_get_int("WORKER_MAX_CONN_NUM"))
+    io_worker->start_accept();
 
   if (cqe.res < 0)
     Log::error("close failed with cqe->res=", std::to_string(cqe.res), false);
@@ -378,7 +385,6 @@ void file_open_awaitable::await_suspend(ConnectionTaskHandler h)
   io_worker = h.promise().io_worker;
 
   is_submitted = io_worker->get_io_uring().open_file_direct(sock_fd_idx, path, mode);
-  // FORCE_ASSERT(is_submitted);
 
   if (!is_submitted)
   {
@@ -388,7 +394,7 @@ void file_open_awaitable::await_suspend(ConnectionTaskHandler h)
 
   h.promise().current_io = OPEN_FILE;
 }
-bool file_open_awaitable::await_resume()
+awaitable_result file_open_awaitable::await_resume()
 {
   // 恢复状态
   FORCE_ASSERT(handler.promise().current_io == IOType::OPEN_FILE);
@@ -397,7 +403,9 @@ bool file_open_awaitable::await_resume()
   if (!is_submitted)
   {
     Log::debug("file open resume, but submit failed on suspend, retry again, sock_fd_idx=", sock_fd_idx);
-    return false;
+    return awaitable_result{
+        .is_submitted = false,
+        .res = -EAGAIN};
   }
 
   auto cqe = handler.promise().cqe;
@@ -406,16 +414,11 @@ bool file_open_awaitable::await_resume()
     Log::error("open file failed, sock_fd_idx=", sock_fd_idx, "|cqe.res=", cqe.res, "|file_path=", path);
     if (cqe.res == -ENFILE)
       Log::error("registered file space not enough, please set a high value");
-    *file_fd_idx = -1;
-    return true;
   }
-  else
-  {
-    Log::debug("open file sucess");
-    *file_fd_idx = cqe.res;
-    return true;
-  }
-  assert(false);
+
+  return awaitable_result{
+      .is_submitted = true,
+      .res = cqe.res};
 }
 
 bool file_close_awaitable::await_ready() { return false; }
@@ -436,7 +439,7 @@ void file_close_awaitable::await_suspend(ConnectionTaskHandler h)
 
   Log::debug("submit file close request, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", file_fd_idx);
 }
-bool file_close_awaitable::await_resume()
+awaitable_result file_close_awaitable::await_resume()
 {
   // 恢复状态
   FORCE_ASSERT(handler.promise().current_io == IOType::CLOSE_FILE);
@@ -445,23 +448,18 @@ bool file_close_awaitable::await_resume()
   if (!is_submitted)
   {
     Log::debug("file close resume, but submit failed on suspend, retry again, sock_fd_idx=", sock_fd_idx);
-    return false;
+    return awaitable_result{
+        .is_submitted = false,
+        .res = -EAGAIN};
   }
 
   auto cqe = handler.promise().cqe;
   if (cqe.res < 0)
-  {
-    Log::error("close file direct failed, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", file_fd_idx,
-               "|cqe.res=", cqe.res);
-    UtilError::error_exit("close file failed", false);
-    return true;
-  }
-  else
-  {
-    Log::debug("close file direct success, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", file_fd_idx);
-    return true;
-  }
-  assert(false);
+    Log::error("close file direct failed, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", file_fd_idx, "|cqe.res=", cqe.res);
+
+  return awaitable_result{
+      .is_submitted = true,
+      .res = cqe.res};
 }
 
 bool file_read_awaitable::await_ready() { return false; }
@@ -471,7 +469,7 @@ void file_read_awaitable::await_suspend(ConnectionTaskHandler h)
   handler = h;
   h.promise().current_io = IOType::READ_FILE;
   // 读取文件
-  is_submitted = io_worker->get_io_uring().read_file(sock_fd_idx, read_file_fd_idx, file_size, read_buf);
+  is_submitted = io_worker->get_io_uring().read_file(sock_fd_idx, read_file_fd_idx, file_size, read_buf, fixed_file);
 
   if (!is_submitted)
   {
@@ -525,19 +523,19 @@ void file_send_awaitable::await_suspend(ConnectionTaskHandler h)
 {
   io_worker = h.promise().io_worker;
   handler = h;
-  h.promise().current_io = IOType::SEND_FILE;
 
-  if (!is_pipe_init)
-  {
-    int ret = pipe(pipefd);
-    if (ret == -1)
-      UtilError::error_exit("create pipe failed, check open file limit", false);
-    is_pipe_init = true;
-  }
+  int ret = pipe(pipefd);
+  if (ret == -1)
+    UtilError::error_exit("create pipe failed, check open file limit", false);
 
-  is_submitted = io_worker->get_io_uring().sendfile(sock_fd_idx, read_file_fd_idx, file_size,
-                                                    h.promise().sendfile_sqe_complete, pipefd, fixed_file);
-  // FORCE_ASSERT(is_submitted);
+  int cqe_num;
+  is_submitted = io_worker->get_io_uring().sendfile(sock_fd_idx, read_file_fd_idx, file_size, &cqe_num, pipefd);
+
+  // 初始化cqe
+  auto &sendfile_cqes = h.promise().sendfile_cqes;
+  sendfile_cqes.resize(cqe_num);
+  for (auto &cqe : sendfile_cqes)
+    cqe.has_recv = false;
 
   // entires不足，将协程放回队列
   if (!is_submitted)
@@ -545,45 +543,65 @@ void file_send_awaitable::await_suspend(ConnectionTaskHandler h)
     io_worker->add_io_resume_task(sock_fd_idx);
     Log::error("sqe not enough while sending file, add back to queue, sock_fd_idx=", sock_fd_idx);
   }
+
+  h.promise().current_io = IOType::SEND_FILE;
 }
-bool file_send_awaitable::await_resume()
+awaitable_result file_send_awaitable::await_resume()
 {
   // 恢复状态
   FORCE_ASSERT(handler.promise().current_io == IOType::SEND_FILE);
   handler.promise().current_io = NONE;
 
-  if (!is_submitted)
-  {
-    Log::debug("file send resume, but submit failed on suspend, retry again, sock_fd_idx=", sock_fd_idx);
-    return false;
-  }
-
   // close
   close(pipefd[0]);
   close(pipefd[1]);
 
-  // 恢复协程，要么是出错，要么是一大串sendfile的io完成
-  // 如果是出错，cqe一定是出错的任务的cqe
-  auto cqe = handler.promise().cqe;
-  if (cqe.res < 0)
+  if (!is_submitted)
   {
-    if (cqe.res == -EPIPE || cqe.res == -ECANCELED)
+    Log::debug("file send resume, but submit failed on suspend, retry again, sock_fd_idx=", sock_fd_idx);
+    return awaitable_result{
+        .is_submitted = false,
+        .res = -EAGAIN};
+  }
+
+  // 恢复协程，要么是出错，要么是一大串sendfile的io完成
+  int send_num = 0;
+  const auto &cqes = handler.promise().sendfile_cqes;
+  for (const auto &info : cqes)
+  {
+    // 成功
+    if (info.cqe.res >= 0)
+    {
+      Log::debug("sendfile success, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", read_file_fd_idx);
+      send_num += info.cqe.res;
+    }
+    // 预料之内的错误（客户端关闭连接）
+    else if (info.cqe.res == -EPIPE || info.cqe.res == -ECANCELED)
+    {
       Log::error("sendfile failed, client unexpertedly closed connection, sock_fd_idx=", sock_fd_idx,
                  "|file_fd_idx=", read_file_fd_idx,
-                 "|cqe.res=", cqe.res);
-    else
+                 "|cqe.res=", info.cqe.res);
+      return awaitable_result{
+          .is_submitted = true,
+          .res = info.cqe.res};
+    }
+    // 预料之外的错误
+    else if (info.cqe.res < 0)
+    {
       Log::error("sendfile failed, sock_fd_idx=", sock_fd_idx,
                  "|file_fd_idx=", read_file_fd_idx,
-                 "|cqe.res=", cqe.res);
-    *is_success = false;
+                 "|cqe.res=", info.cqe.res);
+
+      return awaitable_result{
+          .is_submitted = true,
+          .res = info.cqe.res};
+    }
   }
-  else
-  {
-    Log::debug("sendfile success, sock_fd_idx=", sock_fd_idx,
-               "|file_fd_idx=", read_file_fd_idx);
-    *is_success = true;
-  }
-  return true;
+
+  // 成功
+  return awaitable_result{
+      .is_submitted = true,
+      .res = send_num};
 }
 
 void copy_serialized_buffer_to_write_buffer(IOUringWrapper &io_uring,

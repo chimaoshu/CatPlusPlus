@@ -137,7 +137,6 @@ struct file_open_awaitable
   int sock_fd_idx;
   const std::string &path;
   mode_t mode;
-  int *file_fd_idx;
 
   bool is_submitted = false;
 
@@ -146,16 +145,14 @@ struct file_open_awaitable
 
   bool await_ready();
   void await_suspend(ConnectionTaskHandler h);
-  bool await_resume();
+  awaitable_result await_resume();
 };
-inline auto file_open(int sock_fd_idx, const std::string &path, mode_t mode, int *file_fd_idx)
+inline auto file_open(int sock_fd_idx, const std::string &path, mode_t mode)
 {
   return file_open_awaitable{
       .sock_fd_idx = sock_fd_idx,
       .path = path,
-      .mode = mode,
-      .file_fd_idx = file_fd_idx,
-  };
+      .mode = mode};
 }
 
 // close file
@@ -171,7 +168,7 @@ struct file_close_awaitable
 
   bool await_ready();
   void await_suspend(ConnectionTaskHandler h);
-  bool await_resume();
+  awaitable_result await_resume();
 };
 inline auto file_close(int sock_fd_idx, int file_fd_idx)
 {
@@ -187,6 +184,7 @@ struct file_read_awaitable
   int read_file_fd_idx;
   int file_size;
   send_buf_info &read_buf;
+  bool fixed_file;
 
   // read、write操作发生在io_worker中
   Worker *io_worker = NULL;
@@ -199,12 +197,13 @@ struct file_read_awaitable
   awaitable_result await_resume();
 };
 // 读取磁盘文件
-inline auto file_read(int sock_fd_idx, int read_file_fd_idx, int file_size, send_buf_info &read_buf)
+inline auto file_read(int sock_fd_idx, int read_file_fd_idx, int file_size, send_buf_info &read_buf, bool fixed_file)
 {
   return file_read_awaitable{.sock_fd_idx = sock_fd_idx,
                              .read_file_fd_idx = read_file_fd_idx,
                              .file_size = file_size,
-                             .read_buf = read_buf};
+                             .read_buf = read_buf,
+                             .fixed_file = fixed_file};
 }
 
 // send file from file to socket
@@ -213,29 +212,24 @@ struct file_send_awaitable
   int sock_fd_idx;
   int read_file_fd_idx;
   int file_size;
-  bool *is_success;
-  bool is_pipe_init = false;
+
   int pipefd[2];
 
   bool is_submitted = false;
   Worker *io_worker = NULL;
   ConnectionTaskHandler handler;
 
-  bool fixed_file;
-
   bool await_ready();
   void await_suspend(ConnectionTaskHandler h);
-  bool await_resume();
+  awaitable_result await_resume();
 };
-inline auto file_send(int sock_fd_idx, int read_file_fd_idx, int file_size, bool *is_success,
-                      bool fixed_file)
+// TODO: 加上offet
+inline auto file_send(int sock_fd_idx, int read_file_fd_idx, int file_size)
 {
   return file_send_awaitable{
       .sock_fd_idx = sock_fd_idx,
       .read_file_fd_idx = read_file_fd_idx,
-      .file_size = file_size,
-      .is_success = is_success,
-      .fixed_file = fixed_file};
+      .file_size = file_size};
 }
 
 void copy_serialized_buffer_to_write_buffer(IOUringWrapper &io_uring,

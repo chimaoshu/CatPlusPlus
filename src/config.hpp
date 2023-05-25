@@ -35,15 +35,9 @@ private:
       // 找'='
       int spliter = line.find_first_of('=');
       if (spliter == std::string::npos)
-      {
         UtilError::error_exit("invalid format: '=' missing in line " + std::to_string(line_num), false);
-      }
       else if (line.find_last_of('=') != spliter)
-      {
-        UtilError::error_exit(
-            "invalid format: multiple '=' in line " + std::to_string(line_num),
-            false);
-      }
+        UtilError::error_exit("invalid format: multiple '=' in line " + std::to_string(line_num), false);
 
       // KV
       std::string key = UtilString::strip(line.substr(0, spliter));

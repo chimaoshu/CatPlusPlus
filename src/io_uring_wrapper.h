@@ -33,7 +33,8 @@ enum IOType : uint8_t
   READ_FILE,
   OPEN_FILE,
   CLOSE_FILE,
-  SEND_FILE
+  SEND_FILE,
+  CANCEL_ACCPET
 };
 
 struct IORequestInfo
@@ -43,6 +44,8 @@ struct IORequestInfo
   int16_t req_id;
   // IO类型
   IOType type;
+  // 填充
+  char padding = '0';
 };
 
 struct send_buf_info
@@ -96,23 +99,23 @@ public:
 
   // 提交multishot_accept请求
   void add_multishot_accept(int listen_fd);
+  // 取消IO请求
+  bool cancel_socket_accept(int fd);
   // 提交multishot_recv请求
   bool add_recv(int sock_fd_idx, bool poll_first);
 
   // 关闭连接（提交close请求）
   bool disconnect(int sock_fd_idx);
   // 提交read请求
-  void add_read(int sock_fd_idx, int read_file_fd_idx, const send_buf_info &read_buf);
+  void add_read(int sock_fd_idx, int read_file_fd_idx, const send_buf_info &read_buf, bool fixed_file);
   // 读取文件
-  bool read_file(int sock_fd_idx, int read_file_fd_idx, int file_size, send_buf_info &read_buf);
+  bool read_file(int sock_fd_idx, int read_file_fd_idx, int file_size, send_buf_info &read_buf, bool fixed_file);
   // 打开文件
   bool open_file_direct(int sock_fd_idx, const std::string &path, mode_t mode);
   // 关闭文件
   bool close_direct_file(int sock_fd_idx, int file_fd_idx);
   // sendfile
-  bool sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
-                std::map<int, bool> &sendfile_sqe_complete, int *pipefd,
-                bool fixed_file);
+  bool sendfile(int sock_fd_idx, int file_fd_idx, int file_size, int *sqe_num, int *pipefd);
 
   // 一次性提交多个send
   bool multiple_send(int sock_fd_idx, const std::list<send_buf_info> &buf_infos, bool zero_copy);

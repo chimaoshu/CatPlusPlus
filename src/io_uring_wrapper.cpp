@@ -1,17 +1,14 @@
 #include "io_uring_wrapper.h"
 
+#include <sys/resource.h>
+
 void IOUringWrapper::add_multishot_accept(int listen_fd)
 {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
   FORCE_ASSERT(sqe != NULL);
 
-  static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
-
   // 设置SQE
-  if (use_direct_file)
-    io_uring_prep_multishot_accept_direct(sqe, listen_fd, &client_addr, &client_len, 0);
-  else
-    io_uring_prep_multishot_accept(sqe, listen_fd, &client_addr, &client_len, 0);
+  io_uring_prep_multishot_accept(sqe, listen_fd, &client_addr, &client_len, 0);
 
   // 设置user_data
   IORequestInfo req_info{.fd = listen_fd, .req_id = 0, .type = ACCEPT};
@@ -22,6 +19,26 @@ void IOUringWrapper::add_multishot_accept(int listen_fd)
   io_uring_submit(&ring);
 }
 
+bool IOUringWrapper::cancel_socket_accept(int fd)
+{
+  struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+  if (!sqe)
+    return false;
+
+  // man page:
+  // If the cancelation is successful, the cqe for
+  // the request targeted for cancelation will have
+  // been posted by the time submission returns.
+  io_uring_prep_cancel_fd(sqe, fd, 0);
+  IORequestInfo req_info{.fd = fd, .req_id = 0, .type = CANCEL_ACCPET};
+  memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
+
+  Log::debug("add cancel request");
+  io_uring_submit(&ring);
+
+  return true;
+}
+
 // 提交recv请求
 bool IOUringWrapper::add_recv(int sock_fd_idx, bool poll_first)
 {
@@ -30,12 +47,8 @@ bool IOUringWrapper::add_recv(int sock_fd_idx, bool poll_first)
   if (sqe == NULL)
     return false;
 
-  static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
-
   io_uring_prep_recv(sqe, sock_fd_idx, NULL, 0, 0);
   sqe->buf_group = 0;
-  if (use_direct_file)
-    sqe->flags |= IOSQE_FIXED_FILE;
   sqe->flags |= IOSQE_BUFFER_SELECT;
   sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
 
@@ -76,10 +89,6 @@ bool IOUringWrapper::add_zero_copy_send(int sock_fd_idx, const send_buf_info &in
   }
 
   sqe->flags |= IOSQE_IO_LINK;
-
-  static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
-  if (use_direct_file)
-    sqe->flags |= IOSQE_FIXED_FILE;
 
   Log::debug("add zero copy send, sock_fd_idx=", sock_fd_idx,
              "|write_buf_id=", info.buf_id);
@@ -129,10 +138,6 @@ bool IOUringWrapper::add_zero_copy_sendmsg(int sock_fd_idx, const std::list<send
   else
     io_uring_prep_sendmsg(sqe, sock_fd_idx, &msg, 0);
 
-  static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
-  if (use_direct_file)
-    sqe->flags |= IOSQE_FIXED_FILE;
-
   // user data
   IORequestInfo req_info{.fd = sock_fd_idx, .req_id = 0, .type = zero_copy ? SENDMSG_ZC_SOCKET : SENDMSG_SOCKET};
   memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
@@ -161,17 +166,15 @@ bool IOUringWrapper::add_zero_copy_sendmsg(int sock_fd_idx, const std::list<send
 bool IOUringWrapper::disconnect(int sock_fd_idx)
 {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
-
   if (sqe == NULL)
     return false;
 
-  static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
-  if (use_direct_file)
-    io_uring_prep_close_direct(sqe, sock_fd_idx);
-  else
-    io_uring_prep_close(sqe, sock_fd_idx);
+  io_uring_prep_close(sqe, sock_fd_idx);
+
   IORequestInfo req_info{.fd = sock_fd_idx, .req_id = 0, .type = CLOSE_SOCKET};
   memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
+
+  io_uring_submit(&ring);
   return true;
 }
 
@@ -266,11 +269,12 @@ bool IOUringWrapper::multiple_send(int sock_fd_idx, const std::list<send_buf_inf
 IOUringWrapper::IOUringWrapper()
     : max_conn_num_(config::force_get_int("WORKER_MAX_CONN_NUM")),
       io_uring_entries_(config::force_get_int("WORKER_IO_URING_ENTRIES")),
+      // 每个连接最多以direct方式打开一个web_file，加100应对各种额外的fd打开开销
       max_fixed_file_num_(max_conn_num_ + 100),
       max_buffer_num_(config::force_get_int("WORKER_MAX_BUF_NUM"))
 {
   FORCE_ASSERT(io_uring_entries_ > 0 && io_uring_entries_ > max_conn_num_);
-  FORCE_ASSERT(sizeof(IORequestInfo) <= sizeof(io_uring_sqe::user_data));
+  FORCE_ASSERT(sizeof(IORequestInfo) == sizeof(io_uring_sqe::user_data));
 
   if ((max_buffer_num_ & (max_buffer_num_ - 1)) != 0)
     UtilError::error_exit("max_buffer_num must be the power of 2", false);
@@ -351,7 +355,19 @@ IOUringWrapper::IOUringWrapper()
   }
 
   // 初始化 register file
-  io_uring_register_files_sparse(&ring, max_fixed_file_num_);
+  int ret = io_uring_register_files_sparse(&ring, max_fixed_file_num_);
+  if (ret < 0)
+    UtilError::error_exit("io_uring_register_files_sparse failed|ret=" + std::to_string(ret), false);
+
+  // 设置打开文件限制
+  rlimit limit;
+  limit.rlim_cur = 1048576;
+  limit.rlim_max = 1048576;
+  if (setrlimit(RLIMIT_NOFILE, &limit) == 0)
+  {
+    if (setrlimit(RLIMIT_NOFILE, &limit) != 0)
+      UtilError::error_exit("set max open file limit failed", true);
+  }
 
   // 每个worker的ring都可以注册一个eventfd，用于控制是否shutdown
   // TODO
@@ -359,7 +375,7 @@ IOUringWrapper::IOUringWrapper()
 
 // 提交read请求
 // 调用端保证sqe可用
-void IOUringWrapper::add_read(int sock_fd_idx, int read_file_fd_idx, const send_buf_info &read_buf)
+void IOUringWrapper::add_read(int sock_fd_idx, int read_file_fd_idx, const send_buf_info &read_buf, bool fixed_file)
 {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
   FORCE_ASSERT(sqe != NULL);
@@ -376,7 +392,7 @@ void IOUringWrapper::add_read(int sock_fd_idx, int read_file_fd_idx, const send_
     io_uring_prep_read(sqe, read_file_fd_idx, const_cast<void *>(read_buf.buf), read_buf.len, 0);
   }
 
-  if (config::force_get_int("USE_DIRECT_FILE"))
+  if (fixed_file)
     sqe->flags |= IOSQE_FIXED_FILE;
 
   // user data
@@ -387,8 +403,7 @@ void IOUringWrapper::add_read(int sock_fd_idx, int read_file_fd_idx, const send_
   io_uring_submit(&ring);
 }
 
-bool IOUringWrapper::open_file_direct(int sock_fd_idx, const std::string &path,
-                                      mode_t mode)
+bool IOUringWrapper::open_file_direct(int sock_fd_idx, const std::string &path, mode_t mode)
 {
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
   if (sqe == NULL)
@@ -404,7 +419,8 @@ bool IOUringWrapper::open_file_direct(int sock_fd_idx, const std::string &path,
 
 // 读取文件
 // 优先使用写缓冲池中的buffer（当文件大小小于一页且有可用的缓冲区时）
-bool IOUringWrapper::read_file(int sock_fd_idx, int read_file_fd_idx, int file_size, send_buf_info &read_buf)
+bool IOUringWrapper::read_file(int sock_fd_idx, int read_file_fd_idx, int file_size,
+                               send_buf_info &read_buf, bool fixed_file)
 {
   if (io_uring_sq_space_left(&ring) < 1)
   {
@@ -420,37 +436,34 @@ bool IOUringWrapper::read_file(int sock_fd_idx, int read_file_fd_idx, int file_s
     int buf_id = unused_write_buffer_id_.front();
     unused_write_buffer_id_.pop();
     read_buf = send_buf_info{buf_id, write_buffer_pool_[buf_id], file_size};
-    add_read(sock_fd_idx, read_file_fd_idx, read_buf);
+    add_read(sock_fd_idx, read_file_fd_idx, read_buf, fixed_file);
   }
   // 无法使用缓冲池中的buffer，直接开辟内存
   else
   {
     read_buf = send_buf_info{-1, new char[file_size], file_size};
-    add_read(sock_fd_idx, read_file_fd_idx, read_buf);
+    add_read(sock_fd_idx, read_file_fd_idx, read_buf, fixed_file);
   }
   return true;
 }
 
 // sendfile zero copy
 // sqe不足返回false，成功提交返回false
-bool IOUringWrapper::sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
-                              std::map<int, bool> &sendfile_sqe_complete, int *pipefd,
-                              bool fixed_file)
+bool IOUringWrapper::sendfile(int sock_fd_idx, int file_fd_idx, int file_size, int *sqe_num, int *pipefd)
 {
   // 设置PIPE容量(root)
   static bool can_set_pipe_size = true;
-  int pipe_capacity = config::force_get_int("MAX_PIPE_SIZE");
+  int pipe_capacity = config::force_get_int("SENDFILE_CHUNK_SIZE");
   if (can_set_pipe_size)
   {
     int ret = fcntl(pipefd[0], F_SETPIPE_SZ, pipe_capacity);
     if (ret == -1)
     {
       can_set_pipe_size = false;
-#ifdef PRODUCTION
-      Log::error("set pipe size failed, check if the process runs as root");
-#else
-      UtilError::error_exit("set pipe size failed, check if the process runs as root", true);
-#endif
+      if (UtilEnv::is_production_mode())
+        Log::error("set pipe size failed, check if the process runs as root");
+      else if (UtilEnv::is_debug_mode())
+        UtilError::error_exit("set pipe size failed, check if the process runs as root", true);
     }
     else
     {
@@ -458,11 +471,10 @@ bool IOUringWrapper::sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
       if (ret == -1)
       {
         can_set_pipe_size = false;
-#ifdef PRODUCTION
-        Log::error("set pipe size failed, check if the process runs as root");
-#else
-        UtilError::error_exit("set pipe size failed, check if the process runs as root", true);
-#endif
+        if (UtilEnv::is_production_mode())
+          Log::error("set pipe size failed, check if the process runs as root");
+        else if (UtilEnv::is_debug_mode())
+          UtilError::error_exit("set pipe size failed, check if the process runs as root", true);
       }
       else
       {
@@ -471,7 +483,7 @@ bool IOUringWrapper::sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
     }
   }
 
-  // 设置失败
+  // 设置失败，使用默认的容量
   if (!can_set_pipe_size)
   {
     // 获取PIPE容量
@@ -483,20 +495,21 @@ bool IOUringWrapper::sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
   int blocks = file_size / pipe_capacity;
   int remain = file_size % pipe_capacity;
 
-  // 需要使用的sqe数量
-  int need_sqe_entires = (blocks + (remain > 0)) * 2;
+  // 计算需要使用的sqe数量
+  int need_sqe_num = (blocks + (int)(remain > 0)) * 2;
+  *sqe_num = need_sqe_num;
+
   int available_sqe_entries = io_uring_sq_space_left(&ring);
-  FORCE_ASSERT(io_uring_entries_ > need_sqe_entires);
-  if (available_sqe_entries < need_sqe_entires)
+  FORCE_ASSERT(io_uring_entries_ > need_sqe_num);
+  if (available_sqe_entries < need_sqe_num)
   {
     Log::debug("sendfile failed, sqe not enough, sock_fd_idx=", sock_fd_idx,
                "|left_sqe_num=", available_sqe_entries,
-               "|need_sqe_num=", need_sqe_entires);
+               "|need_sqe_num=", need_sqe_num);
     return false;
   }
 
   int16_t req_id = 0;
-  sendfile_sqe_complete.clear();
   struct io_uring_sqe *last_sqe = NULL;
   for (int i = 0; i < blocks + 1; i++)
   {
@@ -511,37 +524,29 @@ bool IOUringWrapper::sendfile(int sock_fd_idx, int file_fd_idx, int file_size,
     else
       break;
 
-    // file-->pipe, input is fixed file
+    // file-->pipe, input(web file) is fixed file
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
     last_sqe = sqe;
     FORCE_ASSERT(sqe != NULL);
-    io_uring_prep_splice(sqe, file_fd_idx, -1, pipefd[1], -1, nbytes,
-                         SPLICE_F_MOVE | SPLICE_F_MORE);
-    if (fixed_file)
-      sqe->splice_flags |= SPLICE_F_FD_IN_FIXED;
+    io_uring_prep_splice(sqe, file_fd_idx, -1, pipefd[1], -1, nbytes, SPLICE_F_MOVE | SPLICE_F_MORE);
+    sqe->splice_flags |= SPLICE_F_FD_IN_FIXED;
     sqe->flags |= IOSQE_IO_LINK;
+
     // IORequestInfo
     IORequestInfo req_info{.fd = sock_fd_idx, .req_id = req_id, .type = SEND_FILE};
     memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
-    // 后续用于判断是否全部SQE均完成，之后才恢复协程
-    sendfile_sqe_complete[req_id] = false;
     req_id++;
 
-    // pipe-->socket, output is fixed file
+    // pipe-->socket, output(socket) is not fixed file
     struct io_uring_sqe *sqe2 = io_uring_get_sqe(&ring);
     last_sqe = sqe2;
     FORCE_ASSERT(sqe2 != NULL);
-    io_uring_prep_splice(sqe2, pipefd[0], -1, sock_fd_idx, -1, nbytes,
-                         SPLICE_F_MOVE | SPLICE_F_MORE);
-    // TODO：重构
-    if (fixed_file)
-      sqe2->flags |= IOSQE_FIXED_FILE;
+    io_uring_prep_splice(sqe2, pipefd[0], -1, sock_fd_idx, -1, nbytes, SPLICE_F_MOVE | SPLICE_F_MORE);
     sqe2->flags |= IOSQE_IO_LINK;
+
     // IORequestInfo
     IORequestInfo req_info2{.fd = sock_fd_idx, .req_id = req_id, .type = SEND_FILE};
     memcpy(&sqe2->user_data, &req_info2, sizeof(IORequestInfo));
-    // 后续用于判断是否全部SQE均完成，之后才恢复协程
-    sendfile_sqe_complete[req_id] = false;
     req_id++;
 
     Log::debug("add splice, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", file_fd_idx, "|nbytes=", nbytes);
@@ -562,8 +567,8 @@ bool IOUringWrapper::close_direct_file(int sock_fd_idx, int file_fd_idx)
     return false;
 
   io_uring_prep_close_direct(sqe, file_fd_idx);
-  Log::debug("submit close file request, sock_fd_idx=", sock_fd_idx,
-             "|file_fd_idx=", file_fd_idx);
+  Log::debug("submit close file request, sock_fd_idx=", sock_fd_idx, "|file_fd_idx=", file_fd_idx);
+
   IORequestInfo req_info{.fd = sock_fd_idx, .req_id = 0, .type = CLOSE_FILE};
   memcpy(&sqe->user_data, &req_info, sizeof(IORequestInfo));
 

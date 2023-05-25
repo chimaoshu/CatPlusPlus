@@ -51,8 +51,9 @@ public:
   struct promise_type
   {
   public:
-    // 返回值，见errno.h
+    // 返回值
     int ret;
+    bool is_quit = false;
 
     // 负责当前io的worker，在accept后设置，为了使用fixed
     // file特性，协程的recv与send均由该worker完成
@@ -67,7 +68,7 @@ public:
     IOType current_io = IOType::NONE;
 
     // 进行SEND_FILE操作时，记录多个SQE的完成与否，全部完成后才可以恢复协程
-    std::map<int, bool> sendfile_sqe_complete;
+    std::vector<cqe_status> sendfile_cqes;
     std::vector<cqe_status> multiple_send_cqes;
     // sendmsg使用到的iovec
     struct iovec *sendmsg_iov = NULL;
@@ -80,7 +81,11 @@ public:
           std::coroutine_handle<promise_type>::from_promise(*this)};
     }
     // co_return返回值设置
-    void return_value(int ret) { this->ret = ret; }
+    void return_value(int ret)
+    {
+      this->ret = ret;
+      is_quit = true;
+    }
     // 协程初始化时挂起
     auto initial_suspend() noexcept { return std::suspend_always{}; }
     // destroy时立即销毁协程
@@ -143,6 +148,7 @@ private:
   std::map<int, ConnectionTask> connections_;
 
   int listen_fd_;
+  bool is_accepting_ = false;
 
   // 包含global queue与其他worker信息
   Service *service_;
@@ -174,6 +180,7 @@ private:
   friend struct serialize_awaitable;
 
 public:
+  bool is_accpeting() { return is_accepting_; };
   // 提交send_zc请求
   int get_worker_id();
   // 添加process任务至work-stealing-queue
@@ -185,7 +192,8 @@ public:
   IOUringWrapper &get_io_uring() { return io_uring_instance; }
 
 private:
-  void handle_accept(const struct io_uring_cqe *cqe);
+  void handle_accept(struct io_uring_cqe *cqe);
+  void start_accept();
 
 public:
   Worker(int worker_id, ProcessFuncType processor, Service *service);

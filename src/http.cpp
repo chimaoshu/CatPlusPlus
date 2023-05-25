@@ -29,10 +29,9 @@
       UtilError::error_exit("set " #arg " failed", true);                    \
   }
 
+// 打开/关闭套接字特性
 #define OPEN_SOCKET_FEAT(fd, arg) SET_SOCKRT(fd, arg, 1)
 #define CLOSE_SOCKET_FEAT(fd, arg) SET_SOCKRT(fd, arg, 0)
-
-// 关闭特性
 
 // 进行IO操作
 #define ASYNC_IO(sock_fd_idx, func, result)                          \
@@ -46,24 +45,25 @@
     break;                                                           \
   }
 
-// 关闭连接并退出协程
-#define CLOSE_AND_EXIT(sock_fd_idx, result)                       \
-  ASYNC_IO(sock_fd_idx, socket_close(sock_fd_idx), result)        \
-  if (result.res < 0)                                             \
-    Log::error("close socket failed, sock_fd_idx=", sock_fd_idx); \
-  co_return 0;
+// 打开文件
+#define OPEN_FILE(sock_fd_idx, path, mode, result) \
+  ASYNC_IO(sock_fd_idx, file_open(sock_fd_idx, path, mode), result)
 
-// TODO: awaitable_result重构
-#define CLOSE_FILE(fd)                                     \
-  if (use_direct_file)                                     \
-  {                                                        \
-    bool finish_close = false;                             \
-    while (!finish_close)                                  \
-      finish_close = co_await file_close(sock_fd_idx, fd); \
-  }                                                        \
-  else                                                     \
-  {                                                        \
-    close(fd);                                             \
+#define CLOSE_FILE(sock_fd_idx, fd, result)                    \
+  if (fd != -1)                                                \
+    ASYNC_IO(sock_fd_idx, file_close(sock_fd_idx, fd), result) \
+  fd = -1;
+
+#define CLOSE_SOCKET(sock_fd_idx, result) \
+  ASYNC_IO(sock_fd_idx, socket_close(sock_fd_idx), result)
+
+// 关闭连接、web文件并退出协程
+#define CLEAN_AND_EXIT(sock_fd_idx, web_file_fd_idx) \
+  {                                                  \
+    awaitable_result result;                         \
+    CLOSE_FILE(sock_fd_idx, web_file_fd_idx, result) \
+    CLOSE_SOCKET(sock_fd_idx, result)                \
+    co_return 0;                                     \
   }
 
 ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
@@ -85,13 +85,14 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       finish_read = co_await recv_awaitable;
     }
 
+    // web server相关参数
+    int web_file_fd = -1;
+    int web_file_size = -1;
+
     // 读取结束，只读到EOF，说明客户端已经关闭
     // 也不用发bad request，直接关闭连接即可
     if (!parser.got_some())
-    {
-      awaitable_result close_result;
-      CLOSE_AND_EXIT(sock_fd_idx, close_result);
-    }
+      CLEAN_AND_EXIT(sock_fd_idx, web_file_fd);
 
     // 将当前协程挂起，放到work-stealings
     // queue，后续process()操作可由其他worker处理
@@ -111,12 +112,6 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
 
     // processor参数
     struct process_func_args args;
-
-    // web server相关参数
-    int web_server_file_fd = -1;
-    int web_server_file_size = -1;
-    static bool use_direct_file = config::force_get_int("USE_DIRECT_FILE");
-    std::map<const void *, int> web_file_used_buf;
 
     // 完成解析
     bool bad_request = !parser.is_done();
@@ -143,11 +138,11 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     else
     {
       Log::error(
-          "failed to process http "
-          "request|is_header_done|content_length|remain_content_length|",
+          "failed to process http request|is_header_done|content_length|remain_content_length|",
           parser.is_header_done(), "|",
           parser.is_header_done() ? parser.content_length() : -1, "|",
           parser.is_header_done() ? parser.content_length_remaining() : -1);
+
       // 构造一个bad request报文
       response.result(http::status::bad_request);
       response.set(http::field::content_type, "text/html");
@@ -173,31 +168,24 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
 
       // get file size
       if (is_regular_file)
-        web_server_file_size = std::filesystem::file_size(fs_path);
+        web_file_size = std::filesystem::file_size(fs_path);
 
-      // 打开文件，使用direct_file
-      if (is_regular_file && use_direct_file)
+      // 打开文件，使用direct_file方式打开
+      if (is_regular_file)
       {
-        // TODO: 非direct file也支持使用异步打开
-        auto open_awaitable = file_open(sock_fd_idx, args.file_path, O_RDONLY, &web_server_file_fd);
-        while (true)
+        awaitable_result open_result;
+        // open_result.res = open(args.file_path.c_str(), O_RDONLY);
+        OPEN_FILE(sock_fd_idx, args.file_path, O_RDONLY, open_result);
+        if (open_result.res < 0)
         {
-          Log::debug("co_await open, sock_fd_idx=", sock_fd_idx);
-          bool finish_open = co_await open_awaitable;
-          if (!finish_open)
-            continue;
+          Log::error("open file failed|sock_fd_idx=", sock_fd_idx, "|cqe->res=", open_result.res);
+          CLEAN_AND_EXIT(sock_fd_idx, web_file_fd);
         }
-      }
-      // 打开文件，使用普通open
-      else if (is_regular_file && !use_direct_file)
-      {
-        web_server_file_fd = open(args.file_path.c_str(), O_RDONLY);
-        if (web_server_file_fd == -1)
-          Log::error("open file failed, path=", args.file_path, "|ret=", errno);
+        web_file_fd = open_result.res;
       }
 
       // 文件不合法或打开文件失败
-      if (!is_regular_file || web_server_file_fd == -1)
+      if (!is_regular_file || web_file_fd == -1)
       {
         if (!is_regular_file)
           Log::error("not a regular file, file_path=", args.file_path, "|sock_fd_idx=", sock_fd_idx);
@@ -218,17 +206,15 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
         response.version(request.version());
         response.keep_alive(request.keep_alive());
         response.result(http::status::ok);
-        response.content_length(web_server_file_size);
+        response.content_length(web_file_size);
         use_buf_body = false;
       }
 
       // web file size大于阈值使用sendfile进行发送
       static int sendfile_threshold = config::force_get_int("SENDFILE_THRESHOLD");
-      use_sendfile_to_transfer_body = ((sendfile_threshold != -1) &&
-                                       (web_server_file_fd != -1) &&
-                                       (web_server_file_size >= sendfile_threshold));
+      use_sendfile_to_transfer_body = ((sendfile_threshold != -1) && (web_file_fd != -1) && (web_file_size >= sendfile_threshold));
 
-      assert(web_server_file_fd != -1);
+      assert(web_file_fd != -1);
       assert(!bad_request);
       assert(args.use_web_server);
     }
@@ -253,44 +239,40 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     if (ec)
     {
       Log::error(ec.message());
-      awaitable_result close_result;
-      CLOSE_AND_EXIT(sock_fd_idx, close_result);
+      CLEAN_AND_EXIT(sock_fd_idx, web_file_fd);
     }
 
     // web_server常规模式，若web文件较小，则完全读取到内存中再发送
     // 目前认为>=4M属于大文件
-    bool large_web_file = (web_server_file_size >= 4 * 1048576);
+    bool large_web_file = (web_file_size >= 4 * 1048576);
     send_buf_info body_buf_info{.buf_id = -1, .buf = NULL, .len = 0};
     if (args.use_web_server && !use_sendfile_to_transfer_body && !large_web_file)
     {
       // 读取整个web文件
       awaitable_result file_read_result;
-      ASYNC_IO(sock_fd_idx, file_read(sock_fd_idx, web_server_file_fd, web_server_file_size, body_buf_info), file_read_result)
+      ASYNC_IO(sock_fd_idx, file_read(sock_fd_idx, web_file_fd, web_file_size, body_buf_info, true), file_read_result)
 
       // 读取失败，关闭文件、连接并退出
       if (file_read_result.res < 0)
-      {
-        // 关闭文件
-        CLOSE_FILE(web_server_file_fd);
-        awaitable_result close_result;
-        CLOSE_AND_EXIT(sock_fd_idx, close_result)
-      }
+        CLEAN_AND_EXIT(sock_fd_idx, web_file_fd)
 
       // 读取成功，且body较小，将body合并到header中
-      if (web_server_file_size + send_bufs.back().len <= sysconf(_SC_PAGESIZE))
+      if (web_file_size + send_bufs.back().len <= sysconf(_SC_PAGESIZE))
       {
         send_buf_info &header_buf_info = send_bufs.back();
         FORCE_ASSERT(body_buf_info.len + header_buf_info.len <= sysconf(_SC_PAGESIZE));
         memcpy((char *)header_buf_info.buf + header_buf_info.len, body_buf_info.buf, body_buf_info.len);
         header_buf_info.len += body_buf_info.len;
 
-        CLOSE_FILE(web_server_file_fd)
+        awaitable_result close_result;
+        CLOSE_FILE(sock_fd_idx, web_file_fd, close_result)
       }
       // 读取成功，且body无法与header合并，将body独立成一块buffer
       else
       {
         send_bufs.push_back(body_buf_info);
-        CLOSE_FILE(web_server_file_fd)
+        awaitable_result close_result;
+        CLOSE_FILE(sock_fd_idx, web_file_fd, close_result)
       }
     }
 
@@ -313,8 +295,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       if (send_result.res < 0)
       {
         // TODO：清理资源的回调函数（如果有的话）
-        awaitable_result close_result;
-        CLOSE_AND_EXIT(sock_fd_idx, close_result)
+        CLEAN_AND_EXIT(sock_fd_idx, web_file_fd)
       }
       Log::debug("send success, sock_fd_idx=", sock_fd_idx, "send_bufs.size()=", send_bufs.size());
     }
@@ -333,7 +314,7 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     {
       // 剩余的需要发送的数据量
       const int page_size = sysconf(_SC_PAGESIZE);
-      int remain_size = web_server_file_size;
+      int remain_size = web_file_size;
       assert(remain_size > 0);
       while (remain_size > 0)
       {
@@ -343,16 +324,11 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
         // 读取一页
         send_buf_info buf_info;
         awaitable_result file_read_result;
-        ASYNC_IO(sock_fd_idx, file_read(sock_fd_idx, web_server_file_fd, read_size, buf_info), file_read_result)
+        ASYNC_IO(sock_fd_idx, file_read(sock_fd_idx, web_file_fd, read_size, buf_info, true), file_read_result)
 
         // 读取失败
         if (file_read_result.res < 0)
-        {
-          // 关闭文件
-          CLOSE_FILE(web_server_file_fd)
-          awaitable_result close_result;
-          CLOSE_AND_EXIT(sock_fd_idx, close_result)
-        }
+          CLEAN_AND_EXIT(sock_fd_idx, web_file_fd)
 
         // 读取成功，更新剩余字节数量
         remain_size -= read_size;
@@ -361,89 +337,40 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
         awaitable_result send_result;
         // send_result.res = send(sock_fd_idx, buf_info.buf, buf_info.len, 0);
         ASYNC_IO(sock_fd_idx, socket_send(sock_fd_idx, buf_info, false), send_result)
-        // ASYNC_IO(sock_fd_idx, socket_send(sock_fd_idx, buf_info, true), send_result)
 
         // 写失败
         if (send_result.res < 0)
-        {
-          // 关闭文件
-          CLOSE_FILE(web_server_file_fd)
-          awaitable_result close_result;
-          CLOSE_AND_EXIT(sock_fd_idx, close_result)
-        }
+          CLEAN_AND_EXIT(sock_fd_idx, web_file_fd)
       }
     }
 
     // 2、sendfile模式，前面只发送了header，现在body部分需要通过sendfile来实现file到socket的零拷贝发送
     else if (args.use_web_server && use_sendfile_to_transfer_body)
     {
-      bool sendfile_success = false;
+      if (config::force_get_int("TCP_NODELAY"))
+        OPEN_SOCKET_FEAT(sock_fd_idx, TCP_NODELAY);
 
-      // 是否使用异步的sendfile（目前需要使用splice实现）
-      static bool use_async_sendfile = config::force_get_int("USE_ASYNC_SENDFILE");
-      if (use_async_sendfile)
-      {
-        if (config::force_get_int("TCP_NODELAY"))
-          OPEN_SOCKET_FEAT(sock_fd_idx, TCP_NODELAY);
-        bool finish_sendfile = false;
-        auto file_send_awaitable = file_send(sock_fd_idx, web_server_file_fd,
-                                             web_server_file_size, &sendfile_success,
-                                             use_direct_file);
+      awaitable_result sendfile_result;
+      ASYNC_IO(sock_fd_idx, file_send(sock_fd_idx, web_file_fd, web_file_size), sendfile_result)
 
-        while (!finish_sendfile)
-        {
-          Log::debug("co_await file_send, sock_fd_idx=", sock_fd_idx);
-          finish_sendfile = co_await file_send_awaitable;
-        }
-      }
-
-      // 使用同步的sendfile，这将阻塞工作线程
-      else
-      {
-        // 使用direct file的话无法使用sendfile
-        if (use_direct_file)
-          UtilError::error_exit("config error: USE_DIRECT_FILE must be disable if USE_ASYNC_SENDFILE is disable", false);
-
-        off_t offset = 0;
-        int remain_bytes = web_server_file_size;
-        int sendfile_chunked = sysconf(_SC_PAGE_SIZE) * 16;
-        sendfile_success = true;
-        while (remain_bytes > 0)
-        {
-          int ret = sendfile(sock_fd_idx, web_server_file_fd, &offset, sendfile_chunked);
-          if (ret == -1)
-          {
-            sendfile_success = false;
-            Log::error("sync sendfile failed, sock_fd_idx=", sock_fd_idx, "|ret=", ret, "|file_fd=", web_server_file_fd);
-            break;
-          }
-          remain_bytes -= ret;
-        }
-      }
+      if (sendfile_result.res < 0)
+        CLEAN_AND_EXIT(sock_fd_idx, web_file_fd)
 
       // 关闭文件
-      CLOSE_FILE(web_server_file_fd)
-
-      // sendfile失败，断开连接并退出协程
-      if (!sendfile_success)
-      {
-        awaitable_result close_result;
-        CLOSE_AND_EXIT(sock_fd_idx, close_result)
-      }
+      awaitable_result close_result;
+      CLOSE_FILE(sock_fd_idx, web_file_fd, close_result);
     }
 
     // TODO: 考虑加个callback函数，或者PorcessFuncArg里面加个变量
     // 可以销毁buffer body使用的buffer
 
     // 断开连接
-    if (
-        !request.keep_alive() ||
-        (!use_buf_body && !response.keep_alive()) ||
-        (use_buf_body && !response_buf.keep_alive()))
-    {
-      awaitable_result close_result;
-      CLOSE_AND_EXIT(sock_fd_idx, close_result)
-    }
+    if (!request.keep_alive() || (!use_buf_body && !response.keep_alive()) || (use_buf_body && !response_buf.keep_alive()))
+      CLEAN_AND_EXIT(sock_fd_idx, web_file_fd)
+
+    // 不断开连接，也需要关闭文件
+    awaitable_result close_result;
+    CLOSE_FILE(sock_fd_idx, web_file_fd, close_result);
   }
 }
 

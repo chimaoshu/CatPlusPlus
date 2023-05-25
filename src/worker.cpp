@@ -80,7 +80,7 @@ Worker::Worker(int worker_id, ProcessFuncType processor, Service *service)
   }
 
   // 准备multishot-accept，并将listen_fd注册到内核，但不提交
-  io_uring_instance.add_multishot_accept(listen_fd_);
+  start_accept();
 }
 
 void Worker::run()
@@ -145,19 +145,15 @@ void Worker::run()
     int ret = io_uring_wait_cqe_timeout(ring, &cqe, &timeout);
     if (ret < 0 && ret != -ETIME)
     {
-#ifndef PRODUCTION
-      std::terminate();
-#else
-      Log::error("wait cqe failed with ret=", ret);
-#endif
+      if (UtilEnv::is_debug_mode())
+        std::terminate();
+      else
+        Log::error("wait cqe failed with ret=", ret);
     }
 
-    // io_uring没有cqe，则从队列中取
+    // 进入下一轮循环
     if (!cqe)
-    {
-      // 进入下一轮循环
       continue;
-    }
 
     // 有就绪cqe，则进行处理
     io_uring_for_each_cqe(ring, head, cqe)
@@ -169,9 +165,9 @@ void Worker::run()
       memcpy(&info, &cqe->user_data, sizeof(struct IORequestInfo));
       Log::debug("receive cqe, sock_fd_idx=", info.fd, "|type|cqe.res|", (int)info.type, "|", cqe->res);
 
-      // 保护性代码：判断CQE正确性
+      // 保护性代码：判断已建立连接的fd相关CQE正确性
       IOType io_type = info.type;
-      if (io_type != ACCEPT)
+      if (io_type != ACCEPT && io_type != CANCEL_ACCPET)
       {
         auto it = connections_.find(info.fd);
         if (it == connections_.end())
@@ -199,6 +195,15 @@ void Worker::run()
       case IOType::ACCEPT:
       {
         handle_accept(cqe);
+        break;
+      }
+      case IOType::CANCEL_ACCPET:
+      {
+        assert(info.fd == listen_fd_);
+        if (cqe->res == 0)
+          Log::debug("accept is shutdown");
+        else
+          Log::error("accept shutdown failed, cqe->res=", cqe->res);
         break;
       }
       // multiple send需要多个sqe完成才能恢复
@@ -273,42 +278,25 @@ void Worker::run()
       case IOType::SEND_FILE:
       {
         ConnectionTaskHandler handler = connections_.at(info.fd).handler;
-        std::map<int, bool> &sendfile_sqe_complete = handler.promise().sendfile_sqe_complete;
+        std::vector<cqe_status> &sendfile_cqes = handler.promise().sendfile_cqes;
 
-        // 成功，只有当全部sqe完成时再resume
-        if (cqe->res > 0)
-        {
-          sendfile_sqe_complete[info.req_id] = true;
-          // 检查是否全部cqe都已经收到
-        }
-        // 出错
-        else
-        {
-          sendfile_sqe_complete[info.req_id] = true;
-          Log::error("senfile failed, need resume, sock_fd_idx=", info.fd,
-                     "|cqe->res=", cqe->res,
-                     "|req_id=", info.req_id);
-        }
+        sendfile_cqes[info.req_id].has_recv = true;
+        copy_cqe(sendfile_cqes[info.req_id].cqe, *cqe);
 
-        bool resume = true;
-        for (auto &it : sendfile_sqe_complete)
+        // 只有当全部sqe完成时再resume
+        bool recv_all = true;
+        for (auto &cqe : sendfile_cqes)
         {
-          if (!it.second)
+          if (!cqe.has_recv)
           {
-            resume = false;
+            recv_all = false;
             break;
           }
         }
-
-        if (resume)
+        if (recv_all)
         {
-          Log::debug("sendfile resume, sock_fd_idx=", info.fd);
-          copy_cqe(handler.promise().cqe, *cqe);
+          Log::debug("all cqe received, resume sendfile, sock_fd_idx=", info.fd);
           handler.resume();
-        }
-        else
-        {
-          Log::debug("get cqe but no need to resume, sock_fd_idx=", info.fd);
         }
         break;
       }
@@ -387,23 +375,35 @@ void copy_cqe(struct coroutine_cqe &dest, struct io_uring_cqe &src)
   dest.user_data = src.user_data;
 }
 
-void Worker::handle_accept(const struct io_uring_cqe *cqe)
+void Worker::handle_accept(struct io_uring_cqe *cqe)
 {
+  // 取消multishot_accept的cqe
+  if (!is_accepting_)
+  {
+    coroutine_cqe cqe2;
+    copy_cqe(cqe2, *cqe);
+
+    IORequestInfo info = static_cast<IORequestInfo>(cqe->user_data);
+
+    if (info.fd == listen_fd_ && cqe->res == -ECANCELED)
+    {
+      Log::debug("accpet is shutdown");
+      return;
+    }
+    Log::error("calcel failed, cqe->res=", cqe->res);
+    return;
+  }
+
   int sock_fd_idx = cqe->res;
   // accept成功
   if (sock_fd_idx >= 0)
   {
     // fd记录还在，又accept了一个相同的fd
     if (connections_.count(sock_fd_idx))
-    {
-      UtilError::error_exit(
-          "accept a unclosed socket, this should not happen, sock_fd_idx=" +
-              std::to_string(sock_fd_idx),
-          false);
-    }
+      UtilError::error_exit("accept a unclosed socket, this should not happen, sock_fd_idx=" + std::to_string(sock_fd_idx), false);
 
     // 设置tcp_nodelay
-    if (!config::force_get_int("USE_DIRECT_FILE") && config::force_get_int("TCP_NODELAY"))
+    if (config::force_get_int("TCP_NODELAY"))
     {
       int flag = 1;
       if (setsockopt(sock_fd_idx, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) != 0)
@@ -411,8 +411,7 @@ void Worker::handle_accept(const struct io_uring_cqe *cqe)
     }
 
     // 创建协程、添加连接
-    connections_.emplace(sock_fd_idx,
-                         handle_http_request(sock_fd_idx, processor_));
+    connections_.emplace(sock_fd_idx, handle_http_request(sock_fd_idx, processor_));
     Log::debug("accept new connection, sock_fd_idx=", sock_fd_idx);
 
     // 设置worker
@@ -427,26 +426,34 @@ void Worker::handle_accept(const struct io_uring_cqe *cqe)
     Log::error("accept failed cqe->res=", cqe->res);
     // fixed file槽位不足
     if (cqe->res == -ENFILE)
-    {
-      UtilError::error_exit(
-          "fixed file not enough, please set a higher fixed file num, current connections num=" + std::to_string(connections_.size()) +
-              " max_fixed_file_num=" + std::to_string(io_uring_instance.get_max_fixed_file_num()),
-          false);
-    }
+      UtilError::error_exit("file table over flow, conn_num=" + std::to_string(connections_.size()), false);
 
     // 检查IORING_CQE_F_MORE，未设置说明出现了一些错误
     if (!(cqe->flags & IORING_CQE_F_MORE))
     {
-      Log::error(
-          "some error occured and multishot-accept is "
-          "terminated, worker_id:",
-          self_worker_id_, " cqe->res=", cqe->res);
-#ifdef PRODUCTION
+      Log::error("some error occured and multishot-accept is terminated, worker_id:", self_worker_id_, " cqe->res=", cqe->res);
       // 生产环境下，重新添加回去
-      io_uring_instance.add_multishot_accept(listen_fd_);
-#else
-      UtilError::error_exit("multishot-accept is terminated", false);
-#endif
+      if (UtilEnv::is_production_mode())
+        start_accept();
+      else
+        UtilError::error_exit("multishot-accept is terminated", false);
     }
+  }
+
+  // 若达到连接上限，则关闭accept
+  if (connections_.size() == config::force_get_int("WORKER_MAX_CONN_NUM"))
+  {
+    Log::error("connection has reached the upper limit, stop accepting connection");
+    io_uring_instance.cancel_socket_accept(listen_fd_);
+    is_accepting_ = false;
+  }
+}
+
+void Worker::start_accept()
+{
+  if (!is_accepting_)
+  {
+    io_uring_instance.add_multishot_accept(listen_fd_);
+    is_accepting_ = true;
   }
 }

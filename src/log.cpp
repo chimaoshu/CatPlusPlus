@@ -246,8 +246,7 @@ Logger::Logger(const std::string &log_dir,
     fd_list[f.second.file_index] = f.second.fd;
   int ret = io_uring_register_files(&ring_, fd_list.data(), log_files.size());
   if (ret < 0)
-    UtilError::error_exit("failed to register files, " + std::to_string(ret),
-                          false);
+    UtilError::error_exit("failed to register files, " + std::to_string(ret), false);
 
   // 初始化缓存
   std::vector<iovec> buffer_array;
