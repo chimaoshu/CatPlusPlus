@@ -97,11 +97,11 @@ namespace UtilError
       perror(msg.c_str());
     else
       std::cerr << msg << std::endl;
-#ifdef PRODUCTION
-    exit(EXIT_FAILURE);
-#else
-    std::terminate();
-#endif
+
+    if (UtilEnv::is_production_mode())
+      exit(EXIT_FAILURE);
+    else if (UtilEnv::is_debug_mode())
+      std::terminate();
   }
 
 #define FORCE_ASSERT(expr)              \

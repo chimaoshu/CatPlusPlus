@@ -352,13 +352,6 @@ inline auto serialize(T *serializer, std::list<send_buf_info> &send_bufs, bool h
       .header_only = header_only};
 }
 
-// TODO：header和body分开序列化，header手动拷贝到fixed buffer中
-// body如果是string，也分两次发送
-// body如果是buf，直接分两次发送
-// 用那个静态判断，按照模板类型的不同，写不同代码
-// 总之最后的结果就是返回一个 list<buf_info>
-// 之后处理一下cqe的挂起和恢复的问题
-
 struct retrive_buffer_awaitable
 {
   const send_buf_info &buf;
@@ -369,6 +362,5 @@ struct retrive_buffer_awaitable
 
 inline auto retrive_write_buf(const send_buf_info &buf)
 {
-  return retrive_buffer_awaitable{
-      .buf = buf};
+  return retrive_buffer_awaitable{.buf = buf};
 }

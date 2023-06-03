@@ -52,9 +52,8 @@ bool socket_recv_awaitable::await_resume()
     int prov_buf_id = cqe.flags >> 16;
     Log::debug("prov_buf_id=", prov_buf_id, " is used to recv");
 
-#ifndef PRODUCTION
-    std::cout << std::string_view((char *)io_worker->get_io_uring().get_prov_buf(prov_buf_id), cqe.res) << std::flush;
-#endif
+    if (UtilEnv::is_debug_mode())
+      std::cout << std::string_view((char *)io_worker->get_io_uring().get_prov_buf(prov_buf_id), cqe.res) << std::flush;
 
     // 把buffer丢进parser
     error_code err;
@@ -140,9 +139,10 @@ bool socket_recv_awaitable::await_resume()
   else
   {
     Log::error("error recv socket_fd_idx=", sock_fd_idx, " ret=", cqe.res);
-#ifndef PRODUCTION
-    std::terminate();
-#endif
+
+    if (UtilEnv::is_production_mode())
+      std::terminate();
+
     // 不重试，直接退出
     return true;
   }

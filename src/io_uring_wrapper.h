@@ -115,7 +115,7 @@ public:
   // 关闭文件
   bool close_direct_file(int sock_fd_idx, int file_fd_idx);
   // sendfile
-  bool sendfile(int sock_fd_idx, int file_fd_idx, int file_size, int *sqe_num, int *pipefd);
+  bool sendfile(int sock_fd_idx, int file_fd_idx, int chunk_size, int *sqe_num, int *pipefd);
 
   // 一次性提交多个send
   bool multiple_send(int sock_fd_idx, const std::list<send_buf_info> &buf_infos, bool zero_copy);

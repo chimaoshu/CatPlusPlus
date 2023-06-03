@@ -449,7 +449,7 @@ bool IOUringWrapper::read_file(int sock_fd_idx, int read_file_fd_idx, int file_s
 
 // sendfile zero copy
 // sqe不足返回false，成功提交返回false
-bool IOUringWrapper::sendfile(int sock_fd_idx, int file_fd_idx, int file_size, int *sqe_num, int *pipefd)
+bool IOUringWrapper::sendfile(int sock_fd_idx, int file_fd_idx, int chunk_size, int *sqe_num, int *pipefd)
 {
   // 设置PIPE容量(root)
   static bool can_set_pipe_size = true;
@@ -492,8 +492,8 @@ bool IOUringWrapper::sendfile(int sock_fd_idx, int file_fd_idx, int file_size, i
       UtilError::error_exit("get pipe size failed", true);
   }
 
-  int blocks = file_size / pipe_capacity;
-  int remain = file_size % pipe_capacity;
+  int blocks = chunk_size / pipe_capacity;
+  int remain = chunk_size % pipe_capacity;
 
   // 计算需要使用的sqe数量
   int need_sqe_num = (blocks + (int)(remain > 0)) * 2;
