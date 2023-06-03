@@ -243,8 +243,9 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     }
 
     // web_server常规模式，若web文件较小，则完全读取到内存中再发送
-    // 目前认为>=4M属于大文件
-    bool large_web_file = (web_file_size >= 4 * 1048576);
+    // 目前认为>=1M属于大文件
+    const int page_size = sysconf(_SC_PAGESIZE);
+    bool large_web_file = (web_file_size >= 1 * 1048576);
     send_buf_info body_buf_info{.buf_id = -1, .buf = NULL, .len = 0};
     if (args.use_web_server && !use_sendfile_to_transfer_body && !large_web_file)
     {
@@ -257,13 +258,18 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
         CLEAN_AND_EXIT(sock_fd_idx, web_file_fd)
 
       // 读取成功，且body较小，将body合并到header中
-      if (web_file_size + send_bufs.back().len <= sysconf(_SC_PAGESIZE))
+      if (web_file_size + send_bufs.back().len <= page_size)
       {
         send_buf_info &header_buf_info = send_bufs.back();
-        FORCE_ASSERT(body_buf_info.len + header_buf_info.len <= sysconf(_SC_PAGESIZE));
+        FORCE_ASSERT(body_buf_info.len + header_buf_info.len <= page_size);
         memcpy((char *)header_buf_info.buf + header_buf_info.len, body_buf_info.buf, body_buf_info.len);
         header_buf_info.len += body_buf_info.len;
 
+        // 回收body使用的buffer
+        if (body_buf_info.buf != NULL)
+          co_await retrive_write_buf(body_buf_info);
+
+        // 关闭文件
         awaitable_result close_result;
         CLOSE_FILE(sock_fd_idx, web_file_fd, close_result)
       }
@@ -280,8 +286,6 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     // 1、对非web_server模式来说，发送header+body
     // 2、对web_server常规模式来说，发送header或header+body，取决于body能不能塞进header所在的缓存
     // 3、对web_server的sendfile模式来说，发送header
-    // 考虑使用sendmsg一次发送
-    // for (const send_buf_info &buf_info : send_bufs)
     {
       if (config::force_get_int("TCP_NODELAY"))
         OPEN_SOCKET_FEAT(sock_fd_idx, TCP_NODELAY);
@@ -291,18 +295,19 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       awaitable_result send_result;
       ASYNC_IO(sock_fd_idx, socket_send(sock_fd_idx, send_bufs, use_zero_copy), send_result)
 
+      // 回收send_bufs中使用的buffer
+      // 1、当web文件较小与header合并时，send_bufs只包含header使用的buffer
+      // 2、当web文件较大独立存在时，send_bufs包含header和读取到的body的buffer
+      for (const auto &buf : send_bufs)
+        co_await retrive_write_buf(buf);
+
       // 发送出错，关闭连接并退出协程
       if (send_result.res < 0)
       {
-        // TODO：清理资源的回调函数（如果有的话）
         CLEAN_AND_EXIT(sock_fd_idx, web_file_fd)
       }
       Log::debug("send success, sock_fd_idx=", sock_fd_idx, "send_bufs.size()=", send_bufs.size());
     }
-
-    // 回收body使用的buffer
-    if (body_buf_info.buf != NULL)
-      co_await retrive_write_buf(body_buf_info);
 
     // 剩下2种情况需要处理body：
     // 1、webserver常规模式，且web文件过大
@@ -313,7 +318,6 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
     if (args.use_web_server && !use_sendfile_to_transfer_body && large_web_file)
     {
       // 剩余的需要发送的数据量
-      const int page_size = sysconf(_SC_PAGESIZE);
       int remain_size = web_file_size;
       assert(remain_size > 0);
       while (remain_size > 0)
@@ -338,6 +342,9 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
         // send_result.res = send(sock_fd_idx, buf_info.buf, buf_info.len, 0);
         ASYNC_IO(sock_fd_idx, socket_send(sock_fd_idx, buf_info, false), send_result)
 
+        // 回收内存
+        co_await retrive_write_buf(buf_info);
+
         // 写失败
         if (send_result.res < 0)
           CLEAN_AND_EXIT(sock_fd_idx, web_file_fd)
@@ -360,9 +367,6 @@ ConnectionTask handle_http_request(int sock_fd_idx, ProcessFuncType processor)
       awaitable_result close_result;
       CLOSE_FILE(sock_fd_idx, web_file_fd, close_result);
     }
-
-    // TODO: 考虑加个callback函数，或者PorcessFuncArg里面加个变量
-    // 可以销毁buffer body使用的buffer
 
     // 断开连接
     if (!request.keep_alive() || (!use_buf_body && !response.keep_alive()) || (use_buf_body && !response_buf.keep_alive()))
