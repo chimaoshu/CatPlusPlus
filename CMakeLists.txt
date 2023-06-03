@@ -1,45 +1,42 @@
-CMAKE_MINIMUM_REQUIRED(VERSION 3.20)
+cmake_minimum_required(VERSION 3.20)
+project(CatPlusPlus CXX)
 
-PROJECT(CatPlusPlus CXX)
+set(CMAKE_C_COMPILER gcc-10)
+set(CMAKE_CXX_COMPILER g++-10)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-SET(CMAKE_C_COMPILER gcc-10)
-SET(CMAKE_CXX_COMPILER g++-10)
-SET(CMAKE_CXX_STANDARD 20)
-SET(CMAKE_CXX_STANDARD_REQUIRED ON)
+include_directories(src)
+link_directories(src)
 
-INCLUDE_DIRECTORIES(${PROJECT_SOURCE_DIR}/src)
-LINK_DIRECTORIES(${PROJECT_SOURCE_DIR}/src)
+# compile options
+if (CMAKE_BUILD_TYPE AND (CMAKE_BUILD_TYPE STREQUAL "Release"))
+    set(COMMON_COMPILE_OPTIONS -fcoroutines -O3 -DPRODUCTION)
+else()
+    set(COMMON_COMPILE_OPTIONS -fcoroutines -O0 -g)
+endif()
+
+# common link lib
+set(COMMON_LIBRARIES uring pthread)
 
 # log_test
-ADD_EXECUTABLE(log_test src/log.cpp test/log_test.cpp)
-TARGET_LINK_LIBRARIES(log_test uring pthread)
+add_executable(log_test src/log.cpp test/log_test.cpp)
+target_link_libraries(log_test ${COMMON_LIBRARIES})
 
 # echo_server
-ADD_EXECUTABLE(echo_server src/log.cpp src/worker.cpp src/http.cpp src/awaitable.cpp src/io_uring_wrapper.cpp examples/http_echo_server.cpp)
-TARGET_LINK_LIBRARIES(echo_server uring pthread)
-if (CMAKE_BUILD_TYPE AND (CMAKE_BUILD_TYPE STREQUAL "Release"))
-    TARGET_COMPILE_OPTIONS(echo_server PRIVATE -fcoroutines -O3 -DPRODUCTION)
-else()
-    TARGET_COMPILE_OPTIONS(echo_server PRIVATE -fcoroutines -O0 -g)
-endif()
+add_executable(echo_server src/log.cpp src/worker.cpp src/http.cpp src/awaitable.cpp src/io_uring_wrapper.cpp examples/http_echo_server.cpp)
+target_link_libraries(echo_server ${COMMON_LIBRARIES})
+target_compile_options(echo_server PRIVATE ${COMMON_COMPILE_OPTIONS})
 
 # web_server
-ADD_EXECUTABLE(web_server src/log.cpp src/worker.cpp src/http.cpp src/awaitable.cpp src/io_uring_wrapper.cpp examples/http_web_server.cpp)
-TARGET_LINK_LIBRARIES(web_server uring pthread)
-if (CMAKE_BUILD_TYPE AND (CMAKE_BUILD_TYPE STREQUAL "Release"))
-    TARGET_COMPILE_OPTIONS(web_server PRIVATE -fcoroutines -O3 -DPRODUCTION -g)
-else()
-    TARGET_COMPILE_OPTIONS(web_server PRIVATE -fcoroutines -O0 -g)
-endif()
+add_executable(web_server src/log.cpp src/worker.cpp src/http.cpp src/awaitable.cpp src/io_uring_wrapper.cpp examples/http_web_server.cpp)
+target_link_libraries(web_server ${COMMON_LIBRARIES})
+target_compile_options(web_server PRIVATE ${COMMON_COMPILE_OPTIONS})
 
 # io_test_server
-ADD_EXECUTABLE(io_test_server src/log.cpp src/worker.cpp src/http.cpp src/awaitable.cpp src/io_uring_wrapper.cpp examples/io_test_server.cpp)
-TARGET_LINK_LIBRARIES(io_test_server uring pthread)
-if (CMAKE_BUILD_TYPE AND (CMAKE_BUILD_TYPE STREQUAL "Release"))
-    TARGET_COMPILE_OPTIONS(io_test_server PRIVATE -fcoroutines -O3 -DPRODUCTION)
-else()
-    TARGET_COMPILE_OPTIONS(io_test_server PRIVATE -fcoroutines -O0 -g)
-endif()
+add_executable(io_test_server src/log.cpp src/worker.cpp src/http.cpp src/awaitable.cpp src/io_uring_wrapper.cpp examples/io_test_server.cpp)
+target_link_libraries(io_test_server ${COMMON_LIBRARIES})
+target_compile_options(io_test_server PRIVATE ${COMMON_COMPILE_OPTIONS})
 
-SET(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin)
-MESSAGE("PROJECT_SOURCE_DIR=${PROJECT_SOURCE_DIR}")
+set(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin)
+message("PROJECT_SOURCE_DIR=${PROJECT_SOURCE_DIR}")
